@@ -259,6 +259,34 @@ describe("LuaRuntime", () => {
     ).rejects.toThrow(/duplicate choice option id/);
   });
 
+  it("honors AbortSignal while a request handler is still pending", async () => {
+    const runtime = new LuaRuntime();
+    const controller = new AbortController();
+    const run = runtime.run(
+      `return function(ctx)
+        ctx.dialogue:narrate("wait")
+        return ctx.flow:end_story()
+      end`,
+      () => new Promise(() => {}),
+      { state: createTestState(), signal: controller.signal },
+    );
+    controller.abort();
+    await expect(run).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("caps repeated request/resume loops", async () => {
+    const runtime = new LuaRuntime();
+    await expect(
+      runtime.run(
+        `return function(ctx)
+          while true do ctx.dialogue:narrate("loop") end
+        end`,
+        () => undefined,
+        { state: createTestState(), limits: { maxRequests: 3 } },
+      ),
+    ).rejects.toThrow(/Lua request limit exceeded \(3\)/);
+  });
+
   it("validates declared characters and exit ports", async () => {
     const runtime = new LuaRuntime();
     await expect(
@@ -269,6 +297,28 @@ describe("LuaRuntime", () => {
         end`,
         () => undefined,
         { state: createTestState(), characterIds: ["alice"], exits: ["done"] },
+      ),
+    ).rejects.toThrow(/not declared in this scene/);
+
+    await expect(
+      runtime.run(
+        `return function(ctx)
+          ctx.dialogue:say("bob", "not allowed")
+          return ctx.flow:end_story()
+        end`,
+        () => undefined,
+        { state: createTestState(), characterIds: [] },
+      ),
+    ).rejects.toThrow(/not declared in this scene/);
+
+    await expect(
+      runtime.run(
+        `return function(ctx)
+          ctx.dialogue:offscreen("bob", "not allowed")
+          return ctx.flow:end_story()
+        end`,
+        () => undefined,
+        { state: createTestState(), characterIds: ["alice"] },
       ),
     ).rejects.toThrow(/not declared in this scene/);
 

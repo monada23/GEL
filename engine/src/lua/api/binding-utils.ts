@@ -36,7 +36,9 @@ export function readCharacterId(state: LuaState, host: LuaBindingHost, index: nu
 }
 
 export function requireCharacter(host: LuaBindingHost, characterId: string): void {
-  if (host.characterIds !== undefined && host.characterIds.size > 0 && !host.characterIds.has(characterId)) {
+  // `undefined` preserves the standalone Lua debugger's unconstrained mode.
+  // A present empty cast intentionally permits no characters.
+  if (host.characterIds !== undefined && !host.characterIds.has(characterId)) {
     throw new RangeError(`Character '${characterId}' is not declared in this scene`);
   }
 }

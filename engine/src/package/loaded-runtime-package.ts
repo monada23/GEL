@@ -1,6 +1,6 @@
 import type { CharacterDefinition } from "../character";
 import { CharacterRegistry } from "../character";
-import { VirtualPath, type ReadonlyFileSystem } from "../filesystem";
+import type { ReadonlyFileSystem } from "../filesystem";
 import type { VariableDefinition } from "../variables";
 import { AssetRegistry } from "./asset-registry";
 import { RouteTable } from "./route-table";
@@ -23,6 +23,8 @@ export class LoadedRuntimePackage {
   private readonly packageDefinition: RuntimePackage;
   private readonly characterDefinitions: readonly CharacterDefinition[];
   private readonly variableDefinitions: readonly VariableDefinition[];
+  private readonly sceneScripts: ReadonlyMap<string, string>;
+  private readonly scriptPaths: ReadonlyMap<string, string>;
 
   public constructor(
     definition: RuntimePackage,
@@ -30,12 +32,18 @@ export class LoadedRuntimePackage {
     assets: AssetRegistry,
     scenes: SceneRegistry,
     routes: RouteTable,
+    sceneScripts: ReadonlyMap<string, string>,
   ) {
     this.packageDefinition = freezeValue(cloneValue(definition)) as RuntimePackage;
-    this.files = files;
     this.assets = assets;
     this.scenes = scenes;
     this.routes = routes;
+    // Runtime execution must use the exact UTF-8 source that PackageLoader
+    // validated. Retaining a filesystem reference here would permit a mutable
+    // directory package to swap main.lua between validation and execution.
+    this.sceneScripts = new Map(sceneScripts);
+    this.scriptPaths = new Map(this.scenes.all().map((scene) => [scene.id, scene.mainScriptPath.value] as const));
+    this.files = files;
     this.entryScene = this.packageDefinition.entryScene;
     this.characterDefinitions = this.packageDefinition.characters;
     this.variableDefinitions = this.packageDefinition.variables;
@@ -73,11 +81,22 @@ export class LoadedRuntimePackage {
     return cloneValue(this.variableDefinitions);
   }
 
-  /** Read a validated scene's UTF-8 main.lua source without exposing host paths. */
+  /** Return the load-time validated source snapshot for one Scene. */
   public readSceneScript(sceneId: string): string {
-    const scene = this.scenes.require(sceneId);
-    return this.files.readText(VirtualPath.from(scene.mainScriptPath));
+    this.scenes.require(sceneId);
+    const source = this.sceneScripts.get(sceneId);
+    if (source === undefined) throw new Error(`Validated script snapshot is missing for scene '${sceneId}'`);
+    return source;
   }
+
+  /** The load-time logical path associated with a cached scene script. */
+  public getSceneScriptPath(sceneId: string): string {
+    this.scenes.require(sceneId);
+    const path = this.scriptPaths.get(sceneId);
+    if (path === undefined) throw new Error(`Validated script path is missing for scene '${sceneId}'`);
+    return path;
+  }
+
 
   /** Return a fresh mutable character registry owned by one game session. */
   public createCharacterRegistry(): CharacterRegistry {

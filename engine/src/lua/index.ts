@@ -1,4 +1,4 @@
-export { LuaRuntime, type LuaRequestHandler, type LuaRunOptions } from "./runtime/lua-runtime";
+export { LuaRuntime, type LuaRequestHandler, type LuaRunOptions, type LuaRunLimits, DEFAULT_LUA_RUN_MAX_REQUESTS } from "./runtime/lua-runtime";
 export { LuaCoroutine, type LuaStep } from "./runtime/lua-coroutine";
 export { loadLuaScript, type LoadedLuaScript } from "./runtime/script-loader";
 export { LuaApi } from "./api/api-base";

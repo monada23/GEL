@@ -5,6 +5,7 @@ import { pushLuaValue, readRequiredString, isLuaTable } from "../../values/lua-v
 import type { LuaChoiceOption, LuaDialogueRequest, LuaRequest } from "../../protocol/lua-request";
 import { requireIdentifier } from "../../protocol/validators";
 import type { LuaValue } from "../../values/lua-types";
+import { requireCharacter } from "../binding-utils";
 
 /** 对话领域的 Lua API。 */
 export class DialogueApi extends LuaApi {
@@ -21,10 +22,12 @@ export class DialogueApi extends LuaApi {
   }
 
   private say(state: LuaState): number {
+    const speaker = requireIdentifier(readRequiredString(state, 2, "speaker"), "speaker");
+    requireCharacter(this.host, speaker);
     return this.yieldRequest(state, {
       type: "dialogue",
       mode: "character",
-      speaker: requireIdentifier(readRequiredString(state, 2, "speaker"), "speaker"),
+      speaker,
       text: readRequiredString(state, 3, "text"),
     });
   }
@@ -49,6 +52,7 @@ export class DialogueApi extends LuaApi {
 
   private offscreen(state: LuaState): number {
     const speaker = requireIdentifier(readRequiredString(state, 2, "speaker"), "speaker");
+    requireCharacter(this.host, speaker);
     const text = readRequiredString(state, 3, "text");
     const speakerName = this.readOptionalSpeakerName(state);
     return this.yieldRequest(

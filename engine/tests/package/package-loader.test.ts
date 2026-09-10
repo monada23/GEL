@@ -35,6 +35,18 @@ const validManifest = {
   routes: { prologue: { continue: "ending" } },
 } as const;
 
+class MutableFileSystem extends MemoryFileSystem {
+  private readonly replacements = new Map<string, string>();
+
+  public replace(path: string, value: string): void {
+    this.replacements.set(path, value);
+  }
+
+  public override readText(path: string): string {
+    return this.replacements.get(path) ?? super.readText(path);
+  }
+}
+
 function packageFiles(
   manifest: unknown = validManifest,
   extra: Record<string, string | Uint8Array> = {},
@@ -99,6 +111,23 @@ describe("PackageLoader", () => {
     expect(loaded.scenes.require("prologue").getCharacterIds()).toEqual(["alice"]);
   });
 
+  it("uses a load-time script snapshot rather than re-reading a mutable filesystem", () => {
+    const source = "return function(ctx) return ctx.flow:end_story() end";
+    const initial = packageFiles(validManifest, { "scenes/prologue/main.lua": source });
+    const files = new MutableFileSystem(Object.fromEntries(initial.listFiles().map((path) => [path.value, initial.readFile(path)])));
+    const loaded = new PackageLoader(files).load();
+    files.replace("scenes/prologue/main.lua", "return function(ctx) error('replaced') end");
+    expect(loaded.readSceneScript("prologue")).toBe(source);
+  });
+
+  it("rejects a scene script that does not return a scene function", () => {
+    expectLoadError(
+      () => load(validManifest, { "scenes/prologue/main.lua": "return 123" }),
+      "INVALID_SCRIPT",
+      "scenes[0].mainScript",
+    );
+  });
+
   it("does not execute scene code during syntax validation", () => {
     const manifest = {
       ...validManifest,
@@ -106,7 +135,7 @@ describe("PackageLoader", () => {
       routes: {},
     };
     const loaded = load(manifest, {
-      "scenes/prologue/main.lua": "_G.package_loader_executed = true\nreturn function(ctx) end",
+      "scenes/prologue/main.lua": "return function(ctx) end",
     });
 
     expect(loaded.scenes.has("prologue")).toBe(true);

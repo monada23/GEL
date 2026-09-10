@@ -11,6 +11,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build": "tsc",
+    "cli": "npm run build && node dist/src/cli/index.js",
+    "cli:validate": "npm run cli -- validate",
+    "cli:run": "npm run cli -- run",
     "tui:demo": "npm run build && node dist/src/tui/tui-demo.js",
     "tui:play": "npm run build && node dist/src/tui/tui-play.js",
     "package:story": "node ../tools/build-exe.mjs"

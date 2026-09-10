@@ -10,6 +10,13 @@ import type { LuaCapability } from "../values/lua-types";
 import type { LuaSandboxOptions } from "../sandbox/lua-sandbox";
 import type { GameState } from "../../variables";
 
+export interface LuaRunLimits {
+  /** Maximum request/yield exchanges for this Lua scene invocation. */
+  readonly maxRequests?: number;
+}
+
+export const DEFAULT_LUA_RUN_MAX_REQUESTS = 10_000;
+
 export interface LuaRequestHandler {
   (request: LuaRequest): LuaResumeValue | Promise<LuaResumeValue>;
 }
@@ -25,6 +32,8 @@ export interface LuaRunOptions {
   readonly onPresentation?: (event: LuaPresentationEvent) => void;
   /** 开发期扩展 API；每次 runtime 创建独立实例。 */
   readonly apiFactories?: readonly LuaApiFactory[];
+  /** Bounds repeated request/yield loops even when each resume is cheap. */
+  readonly limits?: LuaRunLimits;
 }
 
 export class LuaRuntime {
@@ -43,13 +52,19 @@ export class LuaRuntime {
   }
 
   public async run(source: string, handler: LuaRequestHandler, options: LuaRunOptions): Promise<LuaResult> {
+    throwIfAborted(options.signal);
+    const maxRequests = normalizeMaxRequests(options.limits?.maxRequests);
     const coroutine = this.create(source, options);
     try {
-      throwIfAborted(options.signal);
+      let requestCount = 0;
       let step: LuaStep = coroutine.start();
       while (step.kind === "request") {
         throwIfAborted(options.signal);
-        const response = await handler(step.request);
+        requestCount += 1;
+        if (requestCount > maxRequests) {
+          throw new RangeError(`Lua request limit exceeded (${maxRequests})`);
+        }
+        const response = await awaitHandler(handler, step.request, options.signal);
         throwIfAborted(options.signal);
         validateLuaResponse(step.request, response);
         step = coroutine.resume(response);
@@ -67,6 +82,25 @@ export class LuaRuntime {
       }
     }
   }
+}
+
+function normalizeMaxRequests(value: number | undefined): number {
+  const maxRequests = value ?? DEFAULT_LUA_RUN_MAX_REQUESTS;
+  if (!Number.isSafeInteger(maxRequests) || maxRequests < 1) {
+    throw new RangeError("limits.maxRequests must be a positive safe integer");
+  }
+  return maxRequests;
+}
+
+async function awaitHandler(handler: LuaRequestHandler, request: LuaRequest, signal: AbortSignal | undefined): Promise<LuaResumeValue> {
+  if (signal === undefined) return handler(request);
+  if (signal.aborted) throw new DOMException("Lua run cancelled", "AbortError");
+  return Promise.race([
+    Promise.resolve(handler(request)),
+    new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new DOMException("Lua run cancelled", "AbortError")), { once: true });
+    }),
+  ]);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

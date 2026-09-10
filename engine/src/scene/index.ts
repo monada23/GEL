@@ -10,3 +10,5 @@ export * from "./scene-definition";
 export * from "./scene-executor";
 export * from "./scene-id";
 export * from "./scene-result";
+export * from "./lua-scene-executor";
+export * from "./story-runner";

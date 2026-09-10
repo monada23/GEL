@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import { CharacterRegistry, requireCharacterId } from "../character";
 import { Scene, requireSceneId } from "../scene";
 import { FileSystemError, type ReadonlyFileSystem } from "../filesystem";
-import { lua, lauxlib, to_luastring } from "fengari";
+import { lua } from "fengari";
 import { readLuaError } from "../lua/errors/lua-error";
+import { loadLuaScript } from "../lua/runtime/script-loader";
 import { validateVariableDefinition, type VariableDefinition } from "../variables";
 import { AssetRegistry, requireAssetId } from "./asset-registry";
 import { LoadedRuntimePackage } from "./loaded-runtime-package";
@@ -53,7 +54,7 @@ export class PackageLoader {
     this.validateAssetFiles(assets);
     this.validateMetadata(definition.metadata, assets);
     this.validateCharacterAssets(characters, assets);
-    this.validateScenes(scenes, characters, routes);
+    const sceneScripts = this.validateScenes(scenes, characters, routes);
     this.validateEntryScene(definition.entryScene, scenes);
 
     return new LoadedRuntimePackage(
@@ -69,6 +70,7 @@ export class PackageLoader {
       assets,
       scenes,
       routes,
+      sceneScripts,
     );
   }
 
@@ -266,7 +268,8 @@ export class PackageLoader {
     }
   }
 
-  private validateScenes(scenes: SceneRegistry, characters: CharacterRegistry, routes: RouteTable): void {
+  private validateScenes(scenes: SceneRegistry, characters: CharacterRegistry, routes: RouteTable): ReadonlyMap<string, string> {
+    const scripts = new Map<string, string>();
     // 先验证路由端点，确保一个明显的未知源/目标不会被其他场景的出口覆盖错误遮蔽。
     for (const route of routes.entries()) {
       if (!scenes.has(route.sourceSceneId)) {
@@ -324,11 +327,12 @@ export class PackageLoader {
         }
       }
 
-      this.validateScript(`${scenePath}.mainScript`, scriptPath);
+      scripts.set(scene.id, this.readAndValidateScript(`${scenePath}.mainScript`, scriptPath));
     }
+    return scripts;
   }
 
-  private validateScript(manifestPath: string, scriptPath: string): void {
+  private readAndValidateScript(manifestPath: string, scriptPath: string): string {
     let source: string;
     try {
       source = this.files.readText(scriptPath);
@@ -339,18 +343,16 @@ export class PackageLoader {
       throw packageError(code, manifestPath, `file '${scriptPath}' could not be read as UTF-8`, error);
     }
 
-    const state = lauxlib.luaL_newstate();
     try {
-      const bytes = to_luastring(source);
-      const status = lauxlib.luaL_loadbuffer(state, bytes, bytes.length, to_luastring(scriptPath));
-      if (status !== lua.LUA_OK) {
-        throw readLuaError(state, scriptPath, status);
-      }
+      // Use the same sandboxed loader as runtime. This executes only the
+      // top-level package chunk to establish its returned scene function;
+      // it never calls that function or installs a host ctx.
+      const loaded = loadLuaScript(source, scriptPath, { instructionLimit: 100_000 });
+      lua.lua_close(loaded.mainState);
     } catch (error) {
       throw packageError("INVALID_SCRIPT", manifestPath, messageOf(error), error);
-    } finally {
-      lua.lua_close(state);
     }
+    return source;
   }
 
   private validateEntryScene(entryScene: string, scenes: SceneRegistry): void {
