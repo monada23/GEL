@@ -22,6 +22,7 @@ export class OpenAiCompatibleClient implements LlmClient {
     public readonly baseUrl: string,
     public readonly model: string,
     public readonly reasoning?: ReasoningEffort,
+    public readonly temperature?: number,
   ) {}
 
   public async completeJson(system: string, user: string): Promise<unknown> {
@@ -44,11 +45,8 @@ export class OpenAiCompatibleClient implements LlmClient {
       input,
       stream: true,
     };
-    if (this.reasoning !== undefined) {
-      body.reasoning = { effort: this.reasoning };
-    } else {
-      body.temperature = 0.4;
-    }
+    if (this.reasoning !== undefined) body.reasoning = { effort: this.reasoning };
+    if (this.temperature !== undefined) body.temperature = this.temperature;
     const response = await fetch(`${this.baseUrl}/responses`, {
       method: "POST",
       headers: {
@@ -69,7 +67,7 @@ export class OpenAiCompatibleClient implements LlmClient {
 export async function clientForAgent(agent: AuthorAgent): Promise<OpenAiCompatibleClient> {
   const loaded = await loadAuthorConfig();
   const resolved = resolveAgent(loaded.config, agent, loaded.path);
-  return new OpenAiCompatibleClient(resolved.provider, resolved.apiKey, resolved.baseUrl, resolved.model, resolved.reasoning);
+  return new OpenAiCompatibleClient(resolved.provider, resolved.apiKey, resolved.baseUrl, resolved.model, resolved.reasoning, resolved.temperature);
 }
 
 export function parseJsonPayload(text: string): unknown {
