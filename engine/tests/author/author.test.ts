@@ -145,7 +145,9 @@ describe("scene generation", () => {
     const result = await generateScenes(dir, {
       completeJson: async () => ({ scenes: [] }),
       stream: async (_system, _user, onDelta) => {
-        onDelta(first.slice(0, first.indexOf("Arrive")));
+        onDelta('{"id":"pro');
+        await expect(readFile(join(dir, "scenes", "pro.md"), "utf8")).rejects.toThrow();
+        onDelta(first.slice('{"id":"pro'.length, first.indexOf("Arrive")));
         expect(await readFile(join(dir, "scenes", "prologue.md"), "utf8")).toContain("# Goal");
         expect(await readFile(join(dir, "scenes", "prologue.md"), "utf8")).not.toContain('{"id"');
         onDelta(`${first.slice(first.indexOf("Arrive"))}\n`);

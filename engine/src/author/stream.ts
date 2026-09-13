@@ -69,13 +69,15 @@ export function consumeJsonLines(buffer: string, onObject: (value: unknown) => v
 
 const JSON_ESCAPES: Record<string, string> = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", '"': '"', "\\": "\\", "/": "/" };
 
-export function partialJsonString(text: string, key: string): string | undefined {
+export function partialJsonString(text: string, key: string, requireClosed = false): string | undefined {
   const start = jsonKeyValueStart(text, key);
   if (start < 0) return undefined;
   let i = skipWs(text, start);
-  if (i >= text.length) return "";
+  if (i >= text.length) return requireClosed ? undefined : "";
   if (text[i] !== '"') return undefined;
-  return readPartialJsonString(text, i + 1).value;
+  const read = readPartialJsonString(text, i + 1);
+  if (requireClosed && !read.closed) return undefined;
+  return read.value;
 }
 
 export function partialJsonStringArray(text: string, key: string): string[] | undefined {

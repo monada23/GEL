@@ -322,7 +322,7 @@ async function generateScenesStream(directory: string, client: LlmClient, user: 
     void writeStatus(directory, { state: "running", stage: "scenes", ok: true, message: `Writing ${relative}`, diagnostics: [], previewFile: relative });
   };
   const flushDraft = (): void => {
-    const id = partialJsonString(pending, "id");
+    const id = partialJsonString(pending, "id", true);
     if (id === undefined || !/^[a-z][a-z0-9_.-]*$/.test(id)) return;
     const draft = sceneMarkdownFromPartialJson(pending);
     if (draft.length > 0) show(`scenes/${id}.md`, draft);
