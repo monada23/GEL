@@ -1,4 +1,4 @@
-import { loadAuthorConfig, resolveAgent, type AuthorAgent } from "./config";
+import { loadAuthorConfig, resolveAgent, type AuthorAgent, type ReasoningEffort } from "./config";
 import { readSseContent } from "./stream";
 
 export interface LlmClient {
@@ -21,6 +21,7 @@ export class OpenAiCompatibleClient implements LlmClient {
     public readonly apiKey: string,
     public readonly baseUrl: string,
     public readonly model: string,
+    public readonly reasoning?: ReasoningEffort,
   ) {}
 
   public async completeJson(system: string, user: string): Promise<unknown> {
@@ -31,22 +32,30 @@ export class OpenAiCompatibleClient implements LlmClient {
     if (this.apiKey.trim().length === 0) {
       throw new LlmError("missing_api_key", `Provider '${this.provider}' apiKey is empty`);
     }
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+    const input = extra.length === 0
+      ? user
+      : [
+          { type: "message", role: "user", content: user },
+          ...extra.map((item) => ({ type: "message", role: item.role, content: item.content })),
+        ];
+    const body: Record<string, unknown> = {
+      model: this.model,
+      instructions: system,
+      input,
+      stream: true,
+    };
+    if (this.reasoning !== undefined) {
+      body.reasoning = { effort: this.reasoning };
+    } else {
+      body.temperature = 0.4;
+    }
+    const response = await fetch(`${this.baseUrl}/responses`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${this.apiKey}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        model: this.model,
-        temperature: 0.4,
-        stream: true,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-          ...extra,
-        ],
-      }),
+      body: JSON.stringify(body),
     });
     if (!response.ok) {
       const payload = await response.text();
@@ -60,7 +69,7 @@ export class OpenAiCompatibleClient implements LlmClient {
 export async function clientForAgent(agent: AuthorAgent): Promise<OpenAiCompatibleClient> {
   const loaded = await loadAuthorConfig();
   const resolved = resolveAgent(loaded.config, agent, loaded.path);
-  return new OpenAiCompatibleClient(resolved.provider, resolved.apiKey, resolved.baseUrl, resolved.model);
+  return new OpenAiCompatibleClient(resolved.provider, resolved.apiKey, resolved.baseUrl, resolved.model, resolved.reasoning);
 }
 
 export function parseJsonPayload(text: string): unknown {

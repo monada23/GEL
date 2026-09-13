@@ -187,8 +187,12 @@ function sseDelta(line: string): string {
   if (data.length === 0 || data === "[DONE]") return "";
   const parsed: unknown = JSON.parse(data);
   if (parsed === null || typeof parsed !== "object") return "";
-  const choices = (parsed as { choices?: unknown }).choices;
-  if (!Array.isArray(choices) || choices[0] === null || typeof choices[0] !== "object") return "";
-  const content = (choices[0] as { delta?: { content?: unknown } }).delta?.content;
-  return typeof content === "string" ? content : "";
-}
+  const record = parsed as { type?: unknown; delta?: unknown };
+  if (record.type === "error" || record.type === "response.failed") {
+    throw new Error(typeof (parsed as { error?: { message?: unknown } }).error?.message === "string"
+      ? String((parsed as { error: { message: string } }).error.message)
+      : "LLM response failed");
+  }
+  if (record.type === "response.output_text.delta" && typeof record.delta === "string") return record.delta;
+  return "";
+ }

@@ -18,7 +18,7 @@ const valid = {
   agents: {
     scenes: { provider: "openai", model: "gpt-4o" },
     scripts: { provider: "openai", model: "gpt-4o" },
-    review: { provider: "local", model: "qwen2.5" },
+    review: { provider: "local", model: "qwen2.5", reasoning: "low" },
     ir: { provider: "openai", model: "gpt-4o-mini" },
   },
 };
@@ -62,6 +62,13 @@ describe("author config parse", () => {
   it("rejects unknown fields", () => {
     expect(() => parseAuthorConfig({ ...valid, extra: true }, "mem")).toThrow(/Unknown config field/);
   });
+
+  it("rejects invalid reasoning", () => {
+    expect(() => parseAuthorConfig({
+      ...valid,
+      agents: { ...valid.agents, review: { provider: "local", model: "qwen2.5", reasoning: "max" } },
+    }, "mem")).toThrow(/reasoning/);
+  });
 });
 
 describe("author config files", () => {
@@ -75,6 +82,7 @@ describe("author config files", () => {
     expect(client.baseUrl).toBe("http://127.0.0.1:11434/v1");
     expect(client.model).toBe("qwen2.5");
     expect(client.apiKey).toBe("local-key");
+    expect(client.reasoning).toBe("low");
   });
 
   it("writes a default config once", async () => {

@@ -21,9 +21,13 @@ export interface AuthorProvider {
   apiKey: string;
 }
 
+export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+
 export interface AuthorAgentRef {
   provider: string;
   model: string;
+  reasoning?: ReasoningEffort;
 }
 
 export interface AuthorConfig {
@@ -90,7 +94,7 @@ export function parseAuthorConfig(value: unknown, path: string): AuthorConfig {
   for (const agent of AUTHOR_AGENTS) {
     const raw = value.agents[agent];
     if (!isRecord(raw)) throw new ConfigError("invalid_config", `Agent '${agent}' is required: ${path}`, path);
-    const agentExtra = Object.keys(raw).filter((key) => key !== "provider" && key !== "model");
+    const agentExtra = Object.keys(raw).filter((key) => key !== "provider" && key !== "model" && key !== "reasoning");
     if (agentExtra.length > 0) {
       throw new ConfigError("invalid_config", `Unknown field '${agentExtra[0]}' on agent '${agent}': ${path}`, path);
     }
@@ -100,7 +104,14 @@ export function parseAuthorConfig(value: unknown, path: string): AuthorConfig {
     if (typeof raw.model !== "string" || raw.model.trim().length === 0) {
       throw new ConfigError("invalid_config", `Agent '${agent}' model is required: ${path}`, path);
     }
-    agents[agent] = { provider: raw.provider, model: raw.model };
+    let reasoning: ReasoningEffort | undefined;
+    if (raw.reasoning !== undefined) {
+      if (typeof raw.reasoning !== "string" || !REASONING_EFFORTS.includes(raw.reasoning as ReasoningEffort)) {
+        throw new ConfigError("invalid_config", `Agent '${agent}' reasoning must be one of ${REASONING_EFFORTS.join(", ")}: ${path}`, path);
+      }
+      reasoning = raw.reasoning as ReasoningEffort;
+    }
+    agents[agent] = reasoning === undefined ? { provider: raw.provider, model: raw.model } : { provider: raw.provider, model: raw.model, reasoning };
   }
   const unknownAgents = Object.keys(value.agents).filter((key) => !AUTHOR_AGENTS.includes(key as AuthorAgent));
   if (unknownAgents.length > 0) {
@@ -136,13 +147,13 @@ export function resolveAgent(
   config: AuthorConfig,
   agent: AuthorAgent,
   path = authorConfigPath(),
-): AuthorProvider & { model: string; provider: string } {
+): AuthorProvider & { model: string; provider: string; reasoning?: ReasoningEffort } {
   const ref = config.agents[agent];
   const provider = config.providers[ref.provider];
   if (provider === undefined) {
     throw new ConfigError("invalid_config", `Agent '${agent}' provider '${ref.provider}' is unknown: ${path}`, path);
   }
-  return { ...provider, model: ref.model, provider: ref.provider };
+  return { ...provider, model: ref.model, provider: ref.provider, reasoning: ref.reasoning };
 }
 
 export async function ensureAuthorConfig(): Promise<{

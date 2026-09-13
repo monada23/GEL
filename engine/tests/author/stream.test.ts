@@ -9,8 +9,8 @@ import { initAuthoring } from "../../src/author/workspace";
 import { writeFile } from "node:fs/promises";
 
 function sseChunk(text: string): string {
-  return `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n`;
-}
+  return `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n`;
+ }
 
 describe("SSE and IR events", () => {
   it("assembles tokens split across SSE chunks", async () => {
