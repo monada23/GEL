@@ -66,55 +66,78 @@ export function consumeJsonLines(buffer: string, onObject: (value: unknown) => v
   return rest;
 }
 
-export function foldIrEvents(events: readonly unknown[]): StoryIr {
-  let entryScene = "";
-  const scenes: SceneIrBody[] = [];
-  const routes: Record<string, Record<string, string>> = {};
-  let current: { sceneId: string; title?: string; nodes: SceneIrNode[]; links: SceneIrLink[]; ids: Set<string> } | undefined;
-  const knownScenes = new Set<string>();
+export interface IrFoldState {
+  events: IrEvent[];
+  entryScene: string;
+  scenes: SceneIrBody[];
+  routes: Record<string, Record<string, string>>;
+  current?: { sceneId: string; title?: string; nodes: SceneIrNode[]; links: SceneIrLink[]; ids: Set<string> };
+  done: boolean;
+}
+
+export function emptyIrFold(): IrFoldState {
+  return { events: [], entryScene: "", scenes: [], routes: {}, done: false };
+ }
+
+export function pushIrEvent(state: IrFoldState, raw: unknown): void {
+  if (state.done) throw new StreamError("event after done");
+  const event = parseIrEvent(raw);
   const finishScene = (): void => {
-    if (current === undefined) return;
-    scenes.push({ sceneId: current.sceneId, title: current.title, nodes: current.nodes, links: current.links });
-    knownScenes.add(current.sceneId);
-    current = undefined;
+    if (state.current === undefined) return;
+    state.scenes.push({ sceneId: state.current.sceneId, title: state.current.title, nodes: state.current.nodes, links: state.current.links });
+    state.current = undefined;
   };
-  for (const raw of events) {
-    const event = parseIrEvent(raw);
-    switch (event.op) {
-      case "story":
-        entryScene = event.entryScene;
-        break;
-      case "scene":
-        finishScene();
-        current = { sceneId: event.sceneId, title: event.title, nodes: [], links: [], ids: new Set(["entry"]) };
-        break;
-      case "node":
-        if (current === undefined) throw new StreamError("node event before scene");
-        if (current.ids.has(event.id)) throw new StreamError(`Duplicate node '${event.id}'`);
-        current.ids.add(event.id);
-        current.nodes.push(eventAsNode(event));
-        break;
-      case "link":
-        if (current === undefined) throw new StreamError("link event before scene");
-        if (!current.ids.has(event.from[0]) || !current.ids.has(event.to[0])) {
-          throw new StreamError(`Link target must already exist (${event.from[0]} -> ${event.to[0]})`);
-        }
-        current.links.push([event.from[0], event.from[1], event.to[0], event.to[1]]);
-        break;
-      case "route":
-        finishScene();
-        routes[event.from] ??= {};
-        routes[event.from][event.exit] = event.to;
-        break;
-      case "done":
-        finishScene();
-        break;
+  switch (event.op) {
+    case "story":
+      if (state.entryScene.length > 0) throw new StreamError("duplicate story event");
+      state.entryScene = event.entryScene;
+      break;
+    case "scene":
+      finishScene();
+      state.current = { sceneId: event.sceneId, title: event.title, nodes: [], links: [], ids: new Set(["entry"]) };
+      break;
+    case "node":
+      if (state.current === undefined) throw new StreamError("node event before scene");
+      if (state.current.ids.has(event.id)) throw new StreamError(`Duplicate node '${event.id}'`);
+      state.current.ids.add(event.id);
+      state.current.nodes.push(eventAsNode(event));
+      break;
+    case "link":
+      if (state.current === undefined) throw new StreamError("link event before scene");
+      if (!state.current.ids.has(event.from[0]) || !state.current.ids.has(event.to[0])) {
+        throw new StreamError(`Link target must already exist (${event.from[0]} -> ${event.to[0]})`);
+      }
+      state.current.links.push([event.from[0], event.from[1], event.to[0], event.to[1]]);
+      break;
+    case "route":
+      finishScene();
+      state.routes[event.from] ??= {};
+      state.routes[event.from][event.exit] = event.to;
+      break;
+    case "done":
+      finishScene();
+      state.done = true;
+      break;
+  }
+  state.events.push(event);
+ }
+
+export function finishIrFold(state: IrFoldState): StoryIr {
+  if (!state.done) {
+    if (state.current !== undefined) {
+      state.scenes.push({ sceneId: state.current.sceneId, title: state.current.title, nodes: state.current.nodes, links: state.current.links });
+      state.current = undefined;
     }
   }
-  finishScene();
-  if (!SCENE_ID_RE.test(entryScene)) throw new StreamError("story event with entryScene is required");
-  return { format: STORY_IR_FORMAT, formatVersion: IR_FORMAT_VERSION, entryScene, scenes, routes };
-}
+  if (!SCENE_ID_RE.test(state.entryScene)) throw new StreamError("story event with entryScene is required");
+  return { format: STORY_IR_FORMAT, formatVersion: IR_FORMAT_VERSION, entryScene: state.entryScene, scenes: state.scenes, routes: state.routes };
+ }
+
+export function foldIrEvents(events: readonly unknown[]): StoryIr {
+  const state = emptyIrFold();
+  for (const raw of events) pushIrEvent(state, raw);
+  return finishIrFold(state);
+ }
 
 export function parseIrEvent(value: unknown): IrEvent {
   if (value === null || typeof value !== "object" || !("op" in value)) {

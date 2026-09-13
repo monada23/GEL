@@ -1,4 +1,4 @@
-import { ConfigError } from "./config";
+import { ConfigError, DEFAULT_MAX_CONSECUTIVE_ERRORS, loadAuthorConfig } from "./config";
 import { LlmError, clientForAgent, parseJsonPayload, type LlmClient } from "./llm";
 import { MarkdownParseError, parseOutline, serializeSceneMarkdown, serializeScriptMarkdown } from "./markdown";
 import type { AuthorDiagnostic, AuthorResult, SceneMarkdown, ScriptMarkdown } from "./types";
@@ -6,7 +6,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { authoringDirectory, readAssetTexts, readSceneFiles, readScriptFiles, writeStatus, writeText } from "./workspace";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { consumeJsonLines, foldIrEvents, StreamError } from "./stream";
+import { consumeJsonLines, emptyIrFold, finishIrFold, pushIrEvent, StreamError } from "./stream";
 
 const SCENE_SYSTEM = `You plan Galgame scenes for GEL.
 Return JSON only: {"scenes":[{"id":"prologue","title":"序章","exits":["continue"],"body":"..."}]}.
@@ -213,18 +213,70 @@ async function generateIrStream(directory: string, client: LlmClient, user: stri
   const relative = "ir/stream.jsonl";
   await writeText(directory, relative, "");
   await writeStatus(directory, { state: "running", stage: "ir", ok: true, message: "", diagnostics: [], previewFile: relative });
-  let pending = "";
-  const events: unknown[] = [];
-  const take = (value: unknown): void => {
-    events.push(value);
-    appendFileSync(join(directory, relative), `${JSON.stringify(value)}\n`);
-  };
-  await client.stream!(IR_SYSTEM, user, (delta) => {
-    pending += delta;
-    pending = consumeJsonLines(pending, take);
-  });
-  if (pending.trim().length > 0) take(JSON.parse(pending.trim()));
-  return foldIrEvents(events);
+  const limit = await irErrorLimit();
+  const state = emptyIrFold();
+  let extra: { role: "assistant" | "user"; content: string }[] = [];
+  let consecutive = 0;
+  while (!state.done) {
+    let pending = "";
+    let halt: Error | undefined;
+    await client.stream!(IR_SYSTEM, user, (delta) => {
+      if (halt !== undefined) return;
+      pending += delta;
+      try {
+        pending = consumeJsonLines(pending, (value) => {
+          if (halt !== undefined) return;
+          try {
+            pushIrEvent(state, value);
+            appendFileSync(join(directory, relative), `${JSON.stringify(value)}\n`);
+            consecutive = 0;
+          } catch (error) {
+            halt = error instanceof Error ? error : new Error(String(error));
+          }
+        });
+      } catch (error) {
+        halt = error instanceof Error ? error : new Error(String(error));
+        pending = "";
+      }
+    }, extra);
+    if (halt === undefined && pending.trim().length > 0) {
+      try {
+        const value: unknown = JSON.parse(pending.trim());
+        pushIrEvent(state, value);
+        appendFileSync(join(directory, relative), `${JSON.stringify(value)}\n`);
+        consecutive = 0;
+      } catch (error) {
+        halt = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    if (state.done) break;
+    if (halt === undefined) halt = new StreamError("stream ended before done");
+    consecutive += 1;
+    if (consecutive >= limit) {
+      throw new StreamError(`IR generation stopped after ${limit} consecutive errors: ${halt.message}`);
+    }
+    extra = [
+      { role: "assistant", content: state.events.map((event) => JSON.stringify(event)).join("\n") },
+      { role: "user", content: `Rejected and discarded: ${halt.message}. Continue with the next valid IR event(s) only. Do not repeat accepted events.` },
+    ];
+    await writeStatus(directory, {
+      state: "running",
+      stage: "ir",
+      ok: true,
+      message: `IR error (${consecutive}/${limit}): ${halt.message}`,
+      diagnostics: [],
+      previewFile: relative,
+    });
+  }
+  return finishIrFold(state);
+ }
+
+async function irErrorLimit(): Promise<number> {
+  try {
+    return (await loadAuthorConfig()).config.maxConsecutiveErrors;
+  } catch {
+    return DEFAULT_MAX_CONSECUTIVE_ERRORS;
+  }
 }
 
 function previewDelta(directory: string, stage: string, relative: string): (text: string) => void {

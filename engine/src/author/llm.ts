@@ -3,7 +3,7 @@ import { readSseContent } from "./stream";
 
 export interface LlmClient {
   completeJson(system: string, user: string): Promise<unknown>;
-  stream?(system: string, user: string, onDelta: (text: string) => void): Promise<string>;
+  stream?(system: string, user: string, onDelta: (text: string) => void, extra?: readonly { role: "assistant" | "user"; content: string }[]): Promise<string>;
 }
 
 export class LlmError extends Error {
@@ -27,7 +27,7 @@ export class OpenAiCompatibleClient implements LlmClient {
     return parseJsonPayload(await this.stream(system, user, () => undefined));
   }
 
-  public async stream(system: string, user: string, onDelta: (text: string) => void): Promise<string> {
+  public async stream(system: string, user: string, onDelta: (text: string) => void, extra: readonly { role: "assistant" | "user"; content: string }[] = []): Promise<string> {
     if (this.apiKey.trim().length === 0) {
       throw new LlmError("missing_api_key", `Provider '${this.provider}' apiKey is empty`);
     }
@@ -44,6 +44,7 @@ export class OpenAiCompatibleClient implements LlmClient {
         messages: [
           { role: "system", content: system },
           { role: "user", content: user },
+          ...extra,
         ],
       }),
     });

@@ -38,6 +38,7 @@ describe("author config parse", () => {
         local: { baseUrl: "http://127.0.0.1:11434/v1", apiKey: "local-key" },
       },
       agents: valid.agents,
+      maxConsecutiveErrors: 3,
     });
   });
 

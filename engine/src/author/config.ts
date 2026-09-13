@@ -29,7 +29,10 @@ export interface AuthorAgentRef {
 export interface AuthorConfig {
   providers: Record<string, AuthorProvider>;
   agents: Record<AuthorAgent, AuthorAgentRef>;
+  maxConsecutiveErrors: number;
 }
+
+export const DEFAULT_MAX_CONSECUTIVE_ERRORS = 3;
 
 export const DEFAULT_AUTHOR_CONFIG: AuthorConfig = {
   providers: {
@@ -44,7 +47,8 @@ export const DEFAULT_AUTHOR_CONFIG: AuthorConfig = {
     review: { provider: "openai", model: "gpt-4o" },
     ir: { provider: "openai", model: "gpt-4o" },
   },
-};
+  maxConsecutiveErrors: DEFAULT_MAX_CONSECUTIVE_ERRORS,
+}
 
 export function authorConfigPath(): string {
   const override = process.env.GEL_AUTHOR_CONFIG?.trim();
@@ -56,7 +60,7 @@ export function authorConfigPath(): string {
 
 export function parseAuthorConfig(value: unknown, path: string): AuthorConfig {
   if (!isRecord(value)) throw new ConfigError("invalid_config", `Author config must be an object: ${path}`, path);
-  const extra = Object.keys(value).filter((key) => key !== "providers" && key !== "agents");
+  const extra = Object.keys(value).filter((key) => key !== "providers" && key !== "agents" && key !== "maxConsecutiveErrors");
   if (extra.length > 0) throw new ConfigError("invalid_config", `Unknown config field '${extra[0]}': ${path}`, path);
   if (!isRecord(value.providers) || !isRecord(value.agents)) {
     throw new ConfigError("invalid_config", `providers and agents must be objects: ${path}`, path);
@@ -102,7 +106,14 @@ export function parseAuthorConfig(value: unknown, path: string): AuthorConfig {
   if (unknownAgents.length > 0) {
     throw new ConfigError("invalid_config", `Unknown agent '${unknownAgents[0]}': ${path}`, path);
   }
-  return { providers, agents };
+  let maxConsecutiveErrors = DEFAULT_MAX_CONSECUTIVE_ERRORS;
+  if (value.maxConsecutiveErrors !== undefined) {
+    if (typeof value.maxConsecutiveErrors !== "number" || !Number.isInteger(value.maxConsecutiveErrors) || value.maxConsecutiveErrors < 1) {
+      throw new ConfigError("invalid_config", `maxConsecutiveErrors must be a positive integer: ${path}`, path);
+    }
+    maxConsecutiveErrors = value.maxConsecutiveErrors;
+  }
+  return { providers, agents, maxConsecutiveErrors };
 }
 
 export async function loadAuthorConfig(): Promise<{ path: string; config: AuthorConfig }> {
