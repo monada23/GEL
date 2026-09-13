@@ -34,6 +34,7 @@ export interface AuthorStatus {
   message: string;
   diagnostics: AuthorDiagnostic[];
   result?: AuthorResult | null;
+  previewFile?: string;
 }
 
 export interface SceneMarkdown {

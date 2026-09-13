@@ -1,10 +1,12 @@
 import { ConfigError } from "./config";
-import { LlmError, clientForAgent, type LlmClient } from "./llm";
+import { LlmError, clientForAgent, parseJsonPayload, type LlmClient } from "./llm";
 import { MarkdownParseError, parseOutline, serializeSceneMarkdown, serializeScriptMarkdown } from "./markdown";
 import type { AuthorDiagnostic, AuthorResult, SceneMarkdown, ScriptMarkdown } from "./types";
-import { authoringDirectory, readAssetTexts, readSceneFiles, readScriptFiles, writeText } from "./workspace";
+import { appendFileSync, writeFileSync } from "node:fs";
+import { authoringDirectory, readAssetTexts, readSceneFiles, readScriptFiles, writeStatus, writeText } from "./workspace";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { consumeJsonLines, foldIrEvents, StreamError } from "./stream";
 
 const SCENE_SYSTEM = `You plan Galgame scenes for GEL.
 Return JSON only: {"scenes":[{"id":"prologue","title":"序章","exits":["continue"],"body":"..."}]}.
@@ -22,7 +24,7 @@ export async function generateScenes(directory: string, client?: LlmClient): Pro
     const outline = parseOutline(await readFile(join(dir, "outline.md"), "utf8"));
     const assets = await readAssetTexts(dir);
     const user = `# Title\n${outline.title}\n\n# Outline\n${outline.body}\n\n# Assets\n${assets || "(none)"}`;
-    const payload = await completeWithRetry(llm, SCENE_SYSTEM, user);
+    const payload = await completeWithRetry(llm, SCENE_SYSTEM, user, previewDelta(dir, "scenes", "review/preview.md"));
     const scenes = parseScenePayload(payload);
     for (const scene of scenes) {
       await writeText(dir, `scenes/${scene.id}.md`, serializeSceneMarkdown(scene));
@@ -58,7 +60,7 @@ export async function generateScripts(directory: string, sceneId?: string, clien
     await mapPool(targets, SCRIPT_CONCURRENCY, async (scene) => {
       try {
         const context = packSceneContext(outline.title, outline.body, scene, scenes, assets, mergedFocus);
-        const payload = await completeWithRetry(llm, SCRIPT_SYSTEM, `${context}\n\n# Write script for scene ${scene.id}`);
+        const payload = await completeWithRetry(llm, SCRIPT_SYSTEM, `${context}\n\n# Write script for scene ${scene.id}`, previewDelta(dir, "scripts", "review/preview.md"));
         const script = parseScriptPayload(payload, scene);
         await writeText(dir, `scripts/${script.id}.md`, serializeScriptMarkdown({ ...script, context }));
         written.push(script.id);
@@ -149,10 +151,15 @@ function groupFindings(findings: readonly ReviewFinding[]): Map<string, ReviewFi
   return grouped;
 }
 
-const IR_SYSTEM = `Convert GEL scene scripts into gel.story-ir JSON.
-Return JSON only with format gel.story-ir, formatVersion 1, entryScene, scenes, and routes.
-Allowed node types: gel.dialogue (no speaker), gel.choice, gel.boolean, gel.if, gel.graph_output, gel.end_story.
-Links are [source, sourcePort, target, targetPort]. Use source entry for the scene entry. Dialogue text is narration. Do not emit Lua.`;
+const IR_SYSTEM = `Convert GEL scene scripts into IR events.
+Emit one JSON object per line, no markdown fences.
+Start with {"op":"story","entryScene":"..."}.
+Then for each scene {"op":"scene","sceneId":"...","title":"..."}, then node and link events, then {"op":"route","from":"...","exit":"...","to":"..."}.
+Finish with {"op":"done"}.
+Node events: {"op":"node","id":"d1","type":"gel.dialogue","text":"..."}.
+Link events: {"op":"link","from":["entry","out"],"to":["d1","in"]}.
+Allowed types: gel.dialogue (no speaker), gel.choice, gel.boolean, gel.if, gel.graph_output, gel.end_story.
+Links may only target ids already emitted. Use entry as the scene entry id.`;
 
 export async function generateIr(directory: string, sceneId?: string, client?: LlmClient): Promise<AuthorResult> {
   const dir = authoringDirectory(directory);
@@ -168,7 +175,9 @@ export async function generateIr(directory: string, sceneId?: string, client?: L
       const card = scenes.find((scene) => scene.id === script.id);
       return `# ${script.id}\n${card ? card.body : ""}\n\n${script.body}`;
     }).join("\n\n");
-    const payload = await completeWithRetry(llm, IR_SYSTEM, user);
+    const payload = llm.stream === undefined
+      ? await completeWithRetry(llm, IR_SYSTEM, user)
+      : await generateIrStream(dir, llm, user);
     const { validateStoryIr } = await import("./ir");
     const diagnostics = validateStoryIr(payload);
     if (diagnostics.length > 0) return { ok: false, stage: "ir", directory: dir, diagnostics };
@@ -185,13 +194,46 @@ export async function generateIr(directory: string, sceneId?: string, client?: L
   }
 }
 
-export async function completeWithRetry(client: LlmClient, system: string, user: string): Promise<unknown> {
+export async function completeWithRetry(client: LlmClient, system: string, user: string, onDelta?: (text: string) => void): Promise<unknown> {
+  const once = async (): Promise<unknown> => {
+    if (client.stream !== undefined) {
+      return parseJsonPayload(await client.stream(system, user, onDelta ?? (() => undefined)));
+    }
+    return client.completeJson(system, user);
+  };
   try {
-    return await client.completeJson(system, user);
+    return await once();
   } catch (error) {
     if (!(error instanceof LlmError) || error.code !== "invalid_llm_json") throw error;
-    return client.completeJson(system, `${user}\n\nPrevious output was not valid JSON. Return a JSON object only.`);
+    return once();
   }
+}
+
+async function generateIrStream(directory: string, client: LlmClient, user: string): Promise<unknown> {
+  const relative = "ir/stream.jsonl";
+  await writeText(directory, relative, "");
+  await writeStatus(directory, { state: "running", stage: "ir", ok: true, message: "", diagnostics: [], previewFile: relative });
+  let pending = "";
+  const events: unknown[] = [];
+  const take = (value: unknown): void => {
+    events.push(value);
+    appendFileSync(join(directory, relative), `${JSON.stringify(value)}\n`);
+  };
+  await client.stream!(IR_SYSTEM, user, (delta) => {
+    pending += delta;
+    pending = consumeJsonLines(pending, take);
+  });
+  if (pending.trim().length > 0) take(JSON.parse(pending.trim()));
+  return foldIrEvents(events);
+}
+
+function previewDelta(directory: string, stage: string, relative: string): (text: string) => void {
+  let text = "";
+  void writeStatus(directory, { state: "running", stage, ok: true, message: "", diagnostics: [], previewFile: relative });
+  return (delta: string) => {
+    text += delta;
+    writeFileSync(join(directory, relative), text);
+  };
 }
 
 function parseScenePayload(payload: unknown): SceneMarkdown[] {
@@ -261,7 +303,7 @@ function requiredId(value: unknown): string {
 
 
 function asDiagnostic(error: unknown): AuthorDiagnostic {
-  if (error instanceof LlmError || error instanceof MarkdownParseError || error instanceof ConfigError) {
+  if (error instanceof LlmError || error instanceof MarkdownParseError || error instanceof ConfigError || error instanceof StreamError) {
     return { code: error.code, message: error.message };
   }
   if (error instanceof Error) return { code: "authoring_error", message: error.message };
