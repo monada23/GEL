@@ -179,4 +179,30 @@ describe("scene generation", () => {
     expect(await readFile(join(dir, "scripts", "prologue.md"), "utf8")).toContain("station is quiet");
     expect(await readFile(join(dir, "review", "findings.json"), "utf8")).toContain('"findings": []');
   });
+
+  it("writes story IR from a mock LLM", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-ir-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "prologue.md"), "---\nid: prologue\ntitle: 序章\n---\n\n# Goal\nStart.\n", "utf8");
+    await writeFile(join(dir, "scripts", "prologue.md"), "---\nid: prologue\ntitle: 序章\n---\n\n# Script\nQuiet station.\n", "utf8");
+    const { generateIr } = await import("../../src/author/stages");
+    const story = {
+      format: "gel.story-ir",
+      formatVersion: 1,
+      entryScene: "prologue",
+      scenes: [{
+        sceneId: "prologue",
+        title: "序章",
+        nodes: [
+          { id: "d1", type: "gel.dialogue", text: "The station is quiet." },
+          { id: "end", type: "gel.end_story" },
+        ],
+        links: [["entry", "out", "d1", "in"], ["d1", "next", "end", "in"]],
+      }],
+      routes: {},
+    };
+    const result = await generateIr(dir, undefined, { completeJson: async () => story });
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(await readFile(join(dir, "ir", "story.json"), "utf8")).entryScene).toBe("prologue");
+  });
 });

@@ -144,8 +144,39 @@ function groupFindings(findings: readonly ReviewFinding[]): Map<string, ReviewFi
   return grouped;
 }
 
-export async function generateIr(directory: string, _sceneId?: string, _client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
-  return unavailable("ir", directory);
+const IR_SYSTEM = `Convert GEL scene scripts into gel.story-ir JSON.
+Return JSON only with format gel.story-ir, formatVersion 1, entryScene, scenes, and routes.
+Allowed node types: gel.dialogue (no speaker), gel.choice, gel.boolean, gel.if, gel.graph_output, gel.end_story.
+Links are [source, sourcePort, target, targetPort]. Use source entry for the scene entry. Dialogue text is narration. Do not emit Lua.`;
+
+export async function generateIr(directory: string, sceneId?: string, client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
+  const dir = authoringDirectory(directory);
+  try {
+    const scenes = await readSceneFiles(dir);
+    const scripts = await readScriptFiles(dir);
+    const selected = sceneId === undefined ? scripts : scripts.filter((script) => script.id === sceneId);
+    if (selected.length === 0) {
+      return { ok: false, stage: "ir", directory: dir, diagnostics: [{ code: "missing_scene", message: "No scripts to compile into IR." }] };
+    }
+    const user = selected.map((script) => {
+      const card = scenes.find((scene) => scene.id === script.id);
+      return `# ${script.id}\n${card ? card.body : ""}\n\n${script.body}`;
+    }).join("\n\n");
+    const payload = await completeWithRetry(client, IR_SYSTEM, user);
+    const { validateStoryIr } = await import("./ir");
+    const diagnostics = validateStoryIr(payload);
+    if (diagnostics.length > 0) return { ok: false, stage: "ir", directory: dir, diagnostics };
+    await writeText(dir, "ir/story.json", `${JSON.stringify(payload, null, 2)}\n`);
+    const story = payload as { scenes?: { sceneId?: string }[] };
+    for (const scene of story.scenes ?? []) {
+      if (typeof scene.sceneId === "string") {
+        await writeText(dir, `ir/${scene.sceneId}.json`, `${JSON.stringify({ format: "gel.scene-ir", formatVersion: 1, ...scene }, null, 2)}\n`);
+      }
+    }
+    return { ok: true, stage: "ir", directory: dir, diagnostics: [], entryScene: (payload as { entryScene?: string }).entryScene };
+  } catch (error) {
+    return { ok: false, stage: "ir", directory: dir, diagnostics: [asDiagnostic(error)] };
+  }
 }
 
 export async function completeWithRetry(client: LlmClient, system: string, user: string): Promise<unknown> {
