@@ -22,9 +22,10 @@ export function parseMarkdown(text: string): ParsedMarkdown {
 }
 
 export function parseOutline(text: string): OutlineMarkdown {
-  const parsed = parseMarkdown(text);
-  const title = optionalString(parsed.frontmatter.title, "Untitled Story");
-  return { title, body: parsed.body };
+  if (typeof text !== "string") throw new MarkdownParseError("invalid_markdown", "Markdown must be a string");
+  const body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+  const heading = body.match(/^\s*#\s+(.+)$/m);
+  return { title: heading?.[1]?.trim() || "Untitled Story", body };
 }
 
 export function parseSceneMarkdown(text: string, filenameId?: string): SceneMarkdown {

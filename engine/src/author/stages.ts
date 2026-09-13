@@ -32,7 +32,7 @@ export async function generateScenes(directory: string, client?: LlmClient): Pro
     const llm = client ?? await clientForAgent("scenes");
     const outline = parseOutline(await readFile(join(dir, "outline.md"), "utf8"));
     const assets = await readAssetTexts(dir);
-    const user = `# Title\n${outline.title}\n\n# Outline\n${outline.body}\n\n# Assets\n${assets || "(none)"}`;
+    const user = `${outline.body}\n\n# Assets\n${assets || "(none)"}`;
     const scenes = llm.stream === undefined
       ? parseScenePayload(await completeWithRetry(llm, SCENE_SYSTEM, user, previewDelta(dir, "scenes", "review/preview.md")))
       : await generateScenesStream(dir, llm, user);
@@ -70,20 +70,21 @@ export async function generateScripts(directory: string, sceneId?: string, clien
     const scenes = await readSceneFiles(dir);
     const assets = await readAssetTexts(dir);
     const mergedFocus = [focus, await readFocus(dir)].filter((part) => part.trim().length > 0).join("\n\n");
+    const prefix = packStoryPrefix(outline.title, outline.body, scenes, assets);
     const targets = sceneId === undefined ? scenes : scenes.filter((scene) => scene.id === sceneId);
     if (targets.length === 0) {
       return { ok: false, stage: "scripts", directory: dir, diagnostics: [{ code: "missing_scene", message: sceneId === undefined ? "No scene markdown to script." : `Scene '${sceneId}' is missing.` }] };
     }
     await mapPool(targets, SCRIPT_CONCURRENCY, async (scene) => {
       try {
-        const context = packSceneContext(outline.title, outline.body, scene, scenes, assets, mergedFocus);
+        const task = scriptTask(scene.id, mergedFocus);
         if (llm.stream === undefined) {
-          const payload = await completeWithRetry(llm, SCRIPT_SYSTEM, `${context}\n\n# Write script for scene ${scene.id}`, previewDelta(dir, "scripts", "review/preview.md"));
+          const payload = await completeWithRetry(llm, `${SCRIPT_SYSTEM}\n\n${prefix}`, task, previewDelta(dir, "scripts", "review/preview.md"));
           const script = parseScriptPayload(payload, scene);
-          await writeText(dir, `scripts/${script.id}.md`, serializeScriptMarkdown({ ...script, context }));
+          await writeText(dir, `scripts/${script.id}.md`, serializeScriptMarkdown({ ...script, context: prefix }));
           written.push(script.id);
         } else {
-          written.push(await generateScriptStream(dir, llm, scene, context));
+          written.push(await generateScriptStream(dir, llm, scene, prefix, task));
         }
       } catch (error) {
         diagnostics.push({ ...asDiagnostic(error), path: `scripts/${scene.id}.md` });
@@ -310,44 +311,49 @@ function previewDelta(directory: string, stage: string, relative: string): (text
  }
 
 async function generateScenesStream(directory: string, client: LlmClient, user: string): Promise<SceneMarkdown[]> {
-  const preview = "review/preview.md";
-  await writeText(directory, preview, "");
-  await writeStatus(directory, { state: "running", stage: "scenes", ok: true, message: "", diagnostics: [], previewFile: preview });
+  await writeStatus(directory, { state: "running", stage: "scenes", ok: true, message: "", diagnostics: [], previewFile: "" });
   let pending = "";
+  let previewFile = "";
   const scenes: SceneMarkdown[] = [];
-  const flushPreview = (): void => {
-    const parts = scenes.map((scene) => serializeSceneMarkdown(scene));
+  const show = (relative: string, text: string): void => {
+    writeFileSync(join(directory, relative), text);
+    if (previewFile === relative) return;
+    previewFile = relative;
+    void writeStatus(directory, { state: "running", stage: "scenes", ok: true, message: `Writing ${relative}`, diagnostics: [], previewFile: relative });
+  };
+  const flushDraft = (): void => {
+    const id = partialJsonString(pending, "id");
+    if (id === undefined || !/^[a-z][a-z0-9_.-]*$/.test(id)) return;
     const draft = sceneMarkdownFromPartialJson(pending);
-    if (draft.length > 0) parts.push(draft);
-    writeFileSync(join(directory, preview), parts.join("\n\n"));
+    if (draft.length > 0) show(`scenes/${id}.md`, draft);
   };
   await client.stream!(SCENE_STREAM_SYSTEM, user, (delta) => {
     pending += delta;
     pending = consumeJsonLines(pending, (value) => {
       const scene = sceneFromRecord(value);
-      writeFileSync(join(directory, "scenes", `${scene.id}.md`), serializeSceneMarkdown(scene));
+      show(`scenes/${scene.id}.md`, serializeSceneMarkdown(scene));
       scenes.push(scene);
     });
-    flushPreview();
+    flushDraft();
   });
   if (pending.trim().length > 0) {
     const scene = sceneFromRecord(JSON.parse(pending.trim()));
-    writeFileSync(join(directory, "scenes", `${scene.id}.md`), serializeSceneMarkdown(scene));
+    show(`scenes/${scene.id}.md`, serializeSceneMarkdown(scene));
     scenes.push(scene);
   }
   if (scenes.length === 0) throw new MarkdownParseError("invalid_llm_json", "LLM returned no scenes");
   return scenes;
  }
 
-async function generateScriptStream(directory: string, client: LlmClient, scene: SceneMarkdown, context: string): Promise<string> {
+async function generateScriptStream(directory: string, client: LlmClient, scene: SceneMarkdown, prefix: string, task: string): Promise<string> {
   const relative = `scripts/${scene.id}.md`;
   let body = "";
   const write = (): void => {
-    writeFileSync(join(directory, relative), serializeScriptMarkdown({ id: scene.id, title: scene.title, body, context }));
+    writeFileSync(join(directory, relative), serializeScriptMarkdown({ id: scene.id, title: scene.title, body, context: prefix }));
   };
   write();
   await writeStatus(directory, { state: "running", stage: "scripts", ok: true, message: `Writing ${relative}`, diagnostics: [], previewFile: relative });
-  await client.stream!(SCRIPT_STREAM_SYSTEM, `${context}\n\n# Write script for scene ${scene.id}`, (delta) => {
+  await client.stream!(`${SCRIPT_STREAM_SYSTEM}\n\n${prefix}`, task, (delta) => {
     body += delta;
     write();
   });
@@ -408,11 +414,14 @@ function parseScriptPayload(payload: unknown, scene: SceneMarkdown): ScriptMarkd
   return { id, title, body, context: "" };
 }
 
-function packSceneContext(title: string, outline: string, scene: SceneMarkdown, scenes: readonly SceneMarkdown[], assets: string, focus = ""): string {
-  const others = scenes.filter((item) => item.id !== scene.id).map((item) => `## ${item.id} (${item.title})\nexits: ${item.exits.join(", ") || "(none)"}\n${item.body}`).join("\n\n");
-  const neighbors = scenes.filter((item) => item.id !== scene.id && (scene.exits.includes(item.id) || item.exits.includes(scene.id) || scene.body.includes(item.id) || item.body.includes(scene.id)));
-  const neighborText = neighbors.length === 0 ? "(none)" : neighbors.map((item) => `${item.id}: ${item.title}`).join(", ");
-  return [`# Story\n${title}`, `# Outline\n${outline}`, `# This scene\n${scene.id} (${scene.title})\nexits: ${scene.exits.join(", ") || "(none)"}\n${scene.body}`, `# Neighbors\n${neighborText}`, `# Other scenes\n${others || "(none)"}`, `# Assets\n${assets || "(none)"}`, focus ? `# Focus\n${focus}` : ""].filter((part) => part.length > 0).join("\n\n");
+function packStoryPrefix(title: string, outline: string, scenes: readonly SceneMarkdown[], assets: string): string {
+  const ordered = [...scenes].sort((a, b) => a.id.localeCompare(b.id));
+  const sceneBlock = ordered.map((item) => `## ${item.id} (${item.title})\nexits: ${item.exits.join(", ") || "(none)"}\n${item.body}`).join("\n\n");
+  return [`# Story\n${title}`, `# Outline\n${outline}`, `# Assets\n${assets || "(none)"}`, `# Scenes\n${sceneBlock || "(none)"}`].join("\n\n");
+}
+
+function scriptTask(sceneId: string, focus = ""): string {
+  return [`# Write script for scene ${sceneId}`, focus ? `# Focus\n${focus}` : ""].filter((part) => part.length > 0).join("\n\n");
 }
 
 async function readFocus(directory: string): Promise<string> {

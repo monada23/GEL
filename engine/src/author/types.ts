@@ -123,11 +123,7 @@ export interface StoryIr {
 
 export const AUTHORING_DIRS = ["assets", "scenes", "scripts", "ir", "review"] as const;
 
-export const DEFAULT_OUTLINE = `---
-title: Untitled Story
----
-
-# Outline
+export const DEFAULT_OUTLINE = `# Untitled Story
 
 Write the story outline here.
 `;

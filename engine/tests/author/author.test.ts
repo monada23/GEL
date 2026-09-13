@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { authorMain } from "../../src/author/cli";
 import { validateSceneIrFile, validateStoryIr } from "../../src/author/ir";
-import { parseSceneMarkdown, parseScriptMarkdown, rewriteContext, splitContext } from "../../src/author/markdown";
+import { parseOutline, parseSceneMarkdown, parseScriptMarkdown, rewriteContext, splitContext } from "../../src/author/markdown";
 import { initAuthoring, validateAuthoring } from "../../src/author/workspace";
 
 const validScene = {
@@ -37,6 +37,11 @@ describe("authoring markdown", () => {
     expect(rewritten).toContain("# Script\nKeep this.\n");
     expect(splitContext(parseScriptMarkdown(rewritten).body).body).toContain("Keep this.");
   });
+  it("parses outline as plain markdown", () => {
+    expect(parseOutline("# 放课后\n\n四月开学。")).toEqual({ title: "放课后", body: "# 放课后\n\n四月开学。" });
+  });
+
+ 
 });
 
 describe("authoring IR", () => {
@@ -136,22 +141,24 @@ describe("scene generation", () => {
     await initAuthoring(dir);
     const { generateScenes } = await import("../../src/author/stages");
     const first = JSON.stringify({ id: "prologue", title: "序章", exits: ["continue"], body: "# Goal\nArrive." });
-    const second = `\n${JSON.stringify({ id: "ending", title: "结局", exits: [], body: "# Goal\nEnd." })}\n`;
+    const second = JSON.stringify({ id: "ending", title: "结局", exits: [], body: "# Goal\nEnd." });
     const result = await generateScenes(dir, {
       completeJson: async () => ({ scenes: [] }),
       stream: async (_system, _user, onDelta) => {
         onDelta(first.slice(0, first.indexOf("Arrive")));
-        const preview = await readFile(join(dir, "review", "preview.md"), "utf8");
-        expect(preview).toContain("# Goal");
-        expect(preview).not.toContain('{"id"');
-        onDelta(first.slice(first.indexOf("Arrive")) + second);
-        return first + second;
+        expect(await readFile(join(dir, "scenes", "prologue.md"), "utf8")).toContain("# Goal");
+        expect(await readFile(join(dir, "scenes", "prologue.md"), "utf8")).not.toContain('{"id"');
+        onDelta(`${first.slice(first.indexOf("Arrive"))}\n`);
+        onDelta(second.slice(0, second.indexOf("End")));
+        expect(await readFile(join(dir, "scenes", "ending.md"), "utf8")).toContain("id: ending");
+        onDelta(`${second.slice(second.indexOf("End"))}\n`);
+        return `${first}\n${second}\n`;
       },
     });
     expect(result.ok).toBe(true);
     expect(result.scenes).toEqual(["prologue", "ending"]);
     expect(await readFile(join(dir, "scenes", "prologue.md"), "utf8")).toContain("# Goal");
-    expect(await readFile(join(dir, "review", "preview.md"), "utf8")).toContain("id: prologue");
+    expect(await readFile(join(dir, "scenes", "ending.md"), "utf8")).toContain("End.");
   });
 
   it("streams a script body into the markdown file", async () => {
@@ -178,11 +185,13 @@ describe("scene generation", () => {
     await writeFile(join(dir, "scenes", "ending.md"), "---\nid: ending\ntitle: 结局\n---\n\n# Goal\nEnd.\n", "utf8");
     const { generateScripts } = await import("../../src/author/stages");
     const seen: string[] = [];
+    const systems: string[] = [];
     const result = await generateScripts(dir, undefined, {
-      completeJson: async (_system, user) => {
+      completeJson: async (system, user) => {
+        systems.push(system);
         seen.push(user);
         if (user.includes("Write script for scene ending")) throw new Error("boom");
-        const id = user.includes("prologue") && user.includes("Write script for scene prologue") ? "prologue" : "middle";
+        const id = user.includes("Write script for scene prologue") ? "prologue" : "middle";
         return { id, title: id, body: `# Script\n${id} line.` };
       },
     });
@@ -190,7 +199,9 @@ describe("scene generation", () => {
     expect(result.scripts).toEqual(expect.arrayContaining(["prologue", "middle"]));
     expect(result.scripts).not.toContain("ending");
     expect(await readFile(join(dir, "scripts", "prologue.md"), "utf8")).toContain("prologue line");
-    expect(seen.some((user) => user.includes("Write script for scene prologue") && user.includes("ending: 结局"))).toBe(true);
+    expect(new Set(systems).size).toBe(1);
+    expect(systems[0]).toContain("## ending (结局)");
+    expect(seen.some((user) => user.includes("Write script for scene prologue"))).toBe(true);
   });
 
   it("patches a script once and stops when review is clean", async () => {
