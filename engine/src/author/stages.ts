@@ -181,26 +181,47 @@ Emit one JSON object per line, no markdown fences, in this exact order:
 Rules:
 - Do not emit scene, node, or link. Scene cards already exist.
 - Do not invent scene ids or extra exits.
+- route.to must be an existing scene id, never end_story.
+- A scene with no exits ends in gel.end_story later; emit no route for it.
 - Every listed exit must have exactly one route.
 - entryScene is the first playable scene.`;
 
 const IR_SCENE_SYSTEM = `You fill one GEL scene inner graph from its script.
-Emit one JSON object per line, no markdown fences, in this exact order:
-1. Emit every node before any link. Never link to an id you have not emitted.
-2. {"op":"node","id":"d1","type":"gel.dialogue","text":"..."}
-3. {"op":"link","from":["entry","out"],"to":["d1","in"]} — the first link must leave entry
-4. Every required exit is {"op":"node","id":"<exit>","type":"gel.graph_output","interfaceId":"<exit>"} plus a link into it.
-Do not emit story, scene, route, or done. Do not use speakers or Lua.
-Allowed types: gel.dialogue (no speaker), gel.choice, gel.boolean, gel.if, gel.graph_output, gel.end_story.
-Local ids match ^[a-z][a-z0-9_-]*$. Use entry as the scene entry id.`;
+Emit one JSON object per line, no markdown fences.
+Order: every node, then every link. Never link to an id you have not emitted.
+Do not emit story, scene, route, or done. No speakers, no Lua.
+
+Ports (wrong names fail validation):
+- entry flow out: ["entry","out"]
+- gel.dialogue flow out: ["d1","next"]  (never "out")
+- gel.choice flow out: ["c1","<choice.id>"]
+- gel.if flow out: ["if1","true"] and ["if1","false"]
+- gel.if condition: ["b1","value"] -> ["if1","condition"] from a gel.boolean
+- every flow target port is "in"
+
+Node shapes:
+{"op":"node","id":"d1","type":"gel.dialogue","text":"..."}
+{"op":"node","id":"c1","type":"gel.choice","choices":[{"id":"enter","label":"进去看看"},{"id":"leave","label":"直接回家"}]}
+{"op":"node","id":"b1","type":"gel.boolean","value":true}
+{"op":"node","id":"if1","type":"gel.if"}
+{"op":"node","id":"out","type":"gel.graph_output","interfaceId":"<exit>"}
+{"op":"node","id":"end","type":"gel.end_story"}
+
+Links:
+{"op":"link","from":["entry","out"],"to":["d1","in"]}
+{"op":"link","from":["d1","next"],"to":["c1","in"]}
+
+If this scene continues to another scene, each required exit is a gel.graph_output whose interfaceId equals that exit.
+If this scene ends the story, use gel.end_story and no graph_output.
+Local ids match ^[a-z][a-z0-9_-]*$. Choice ids must start with a letter, not a digit.`;
 
 const IR_GRAPH_JSON_SYSTEM = `You lay out a GEL story graph.
 Return JSON only: {"entryScene":"prologue","routes":{"prologue":{"enter":"library"}}}.
-Use only given scene ids. Every listed exit needs a route. No nodes.`;
+Use only given scene ids. Every listed exit needs a route. route.to is a scene id, never end_story. No nodes.`;
 
 const IR_SCENE_JSON_SYSTEM = `You fill one GEL scene from its script.
 Return JSON only: {"nodes":[{"id":"d1","type":"gel.dialogue","text":"..."},{"id":"end","type":"gel.end_story"}],"links":[["entry","out","d1","in"],["d1","next","end","in"]]}.
-First link must leave entry. Required exits are gel.graph_output nodes with that interfaceId. No speakers.`;
+Dialogue flow port is next, not out. Choice options are {id,label} with letter-starting ids. If needs a gel.boolean linked to condition. Story end is gel.end_story, not graph_output.`;
 
 const IR_SCENE_CONCURRENCY = 3;
 
@@ -301,10 +322,13 @@ async function generateIrStream(directory: string, client: LlmClient, prefix: st
 async function generateSceneInteriorStream(client: LlmClient, prefix: string, script: ScriptMarkdown, scenes: readonly SceneMarkdown[], directory: string): Promise<unknown[]> {
   const events: unknown[] = [{ op: "scene", sceneId: script.id, title: script.title }];
   const ids = new Set<string>(["entry"]);
+  const kinds = new Map<string, string>([["entry", "entry"]]);
+  const choiceIds = new Map<string, string[]>();
   const accepted: unknown[] = [];
   let finished = false;
   await runJsonlStream(client, IR_SCENE_SYSTEM, irSceneUser(prefix, script, scenes), (value) => {
-    const event = parseIrEvent(value);
+    const normalized = normalizeSceneEvent(value, kinds, choiceIds);
+    const event = parseIrEvent(normalized);
     if (event.op === "done") {
       finished = true;
       return;
@@ -313,11 +337,16 @@ async function generateSceneInteriorStream(client: LlmClient, prefix: string, sc
     if (event.op === "node") {
       if (ids.has(event.id)) throw new StreamError(`Duplicate node '${event.id}'`);
       ids.add(event.id);
+      kinds.set(event.id, event.type);
+      const choices = "choices" in event ? (event as { choices?: unknown }).choices : undefined;
+      if (event.type === "gel.choice" && Array.isArray(choices)) {
+        choiceIds.set(event.id, choices.map((item) => String((item as { id: string }).id)));
+      }
     } else if (!ids.has(event.from[0]) || !ids.has(event.to[0])) {
       throw new StreamError(`Link target must already exist (${event.from[0]} -> ${event.to[0]})`);
     }
-    events.push(value);
-    accepted.push(value);
+    events.push(normalized);
+    accepted.push(normalized);
   }, () => finished, () => accepted.map((item) => JSON.stringify(item)).join("\n"), "stream-end", directory);
   if (ids.size <= 1) throw new StreamError(`Scene '${script.id}' emitted no nodes`);
   return events;
@@ -393,7 +422,7 @@ function irGraphUser(prefix: string, selected: readonly ScriptMarkdown[], scenes
 function irSceneUser(prefix: string, script: ScriptMarkdown, scenes: readonly SceneMarkdown[]): string {
   const card = scenes.find((scene) => scene.id === script.id);
   const exits = card?.exits.join(", ") || "(none)";
-  return `${prefix}\n\n# Fill scene ${script.id}\nRequired graph_output interfaceIds: ${exits}\n\n# Script\n${script.body}\n\nEmit nodes first, then links. First link must leave entry.`;
+  return `${prefix}\n\n# Fill scene ${script.id}\nRequired graph_output interfaceIds: ${exits}\n\n# Script\n${script.body}\n\nEmit nodes first, then links. Dialogue uses next (not out). First link must leave entry.`;
 }
 
 function parseGraphPayload(payload: unknown): { entryScene: string; routes: Record<string, Record<string, string>> } {
@@ -414,11 +443,62 @@ function parseGraphPayload(payload: unknown): { entryScene: string; routes: Reco
   return { entryScene: record.entryScene, routes };
 }
 
+function normalizeSceneEvent(raw: unknown, kinds: Map<string, string>, choiceIds: Map<string, string[]>): unknown {
+  if (raw === null || typeof raw !== "object" || !("op" in raw)) return raw;
+  const event = raw as Record<string, unknown>;
+  if (event.op === "node" && event.type === "gel.choice") {
+    return { ...event, choices: normalizeChoices(event.choices) };
+  }
+  if (event.op === "link" && Array.isArray(event.from) && event.from.length === 2 && typeof event.from[0] === "string" && typeof event.from[1] === "string") {
+    const from: [string, string] = [event.from[0], event.from[1]];
+    if (from[1] === "out" && kinds.get(from[0]) === "gel.dialogue") from[1] = "next";
+    const indexed = choiceIds.get(from[0]);
+    if (indexed !== undefined && /^\d+$/.test(from[1])) {
+      const id = indexed[Number(from[1])];
+      if (id !== undefined) from[1] = id;
+    }
+    return { ...event, from };
+  }
+  return raw;
+}
+
+function normalizeChoices(raw: unknown): { id: string; label: string }[] {
+  if (!Array.isArray(raw)) return [];
+  const choices: { id: string; label: string }[] = [];
+  for (const [index, item] of raw.entries()) {
+    if (item === null || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const label = typeof record.label === "string" ? record.label : typeof record.text === "string" ? record.text : "";
+    let id = typeof record.id === "string" ? record.id : typeof record.port === "string" ? record.port : "";
+    if (!/^[a-z][a-z0-9_-]*$/.test(id)) id = `c${index}`;
+    if (label.length === 0) continue;
+    choices.push({ id, label });
+  }
+  return choices;
+}
+
 function parseSceneInterior(payload: unknown): { nodes: unknown[]; links: unknown[] } {
   if (payload === null || typeof payload !== "object") throw new StreamError("scene IR payload must be an object");
   const record = payload as Record<string, unknown>;
   if (!Array.isArray(record.nodes) || !Array.isArray(record.links)) throw new StreamError("scene IR requires nodes and links arrays");
-  return { nodes: record.nodes, links: record.links };
+  const kinds = new Map<string, string>([["entry", "entry"]]);
+  const choiceIds = new Map<string, string[]>();
+  const nodes = record.nodes.map((node) => {
+    const normalized = normalizeSceneEvent({ op: "node", ...(node as object) }, kinds, choiceIds);
+    const event = normalized as { op: string; id?: string; type?: string; choices?: { id: string }[] };
+    if (typeof event.id === "string" && typeof event.type === "string") {
+      kinds.set(event.id, event.type);
+      if (event.type === "gel.choice" && Array.isArray(event.choices)) choiceIds.set(event.id, event.choices.map((item) => item.id));
+    }
+    const { op: _op, ...rest } = event as { op: string } & Record<string, unknown>;
+    return rest;
+  });
+  const links = record.links.map((link) => {
+    if (!Array.isArray(link) || link.length !== 4) return link;
+    const normalized = normalizeSceneEvent({ op: "link", from: [link[0], link[1]], to: [link[2], link[3]] }, kinds, choiceIds) as { from: [string, string]; to: [string, string] };
+    return [normalized.from[0], normalized.from[1], normalized.to[0], normalized.to[1]];
+  });
+  return { nodes, links };
 }
 export async function completeWithRetry(client: LlmClient, system: string, user: string, onDelta?: (text: string) => void): Promise<unknown> {
   const once = async (): Promise<unknown> => {

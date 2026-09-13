@@ -246,12 +246,14 @@ describe("scene generation", () => {
             { id: "d1", type: "gel.dialogue", text: "The station is quiet." },
             { id: "end", type: "gel.end_story" },
           ],
-          links: [["entry", "out", "d1", "in"], ["d1", "next", "end", "in"]],
+          links: [["entry", "out", "d1", "in"], ["d1", "out", "end", "in"]],
         };
       },
     });
     expect(result.ok).toBe(true);
-    expect(JSON.parse(await readFile(join(dir, "ir", "story.json"), "utf8")).entryScene).toBe("prologue");
+    const story = JSON.parse(await readFile(join(dir, "ir", "story.json"), "utf8")) as { entryScene: string; scenes: { links: unknown[] }[] };
+    expect(story.entryScene).toBe("prologue");
+    expect(story.scenes[0].links).toContainEqual(["d1", "next", "end", "in"]);
   });
 
   it("includes review/focus.txt when scripting a scene", async () => {
