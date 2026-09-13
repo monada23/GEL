@@ -1,0 +1,117 @@
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { authorMain } from "../../src/author/cli";
+import { validateSceneIrFile, validateStoryIr } from "../../src/author/ir";
+import { parseSceneMarkdown, parseScriptMarkdown, rewriteContext, splitContext } from "../../src/author/markdown";
+import { initAuthoring, validateAuthoring } from "../../src/author/workspace";
+
+const validScene = {
+  sceneId: "prologue",
+  title: "序章",
+  nodes: [
+    { id: "d1", type: "gel.dialogue", text: "车站很安静。" },
+    { id: "end", type: "gel.end_story" },
+  ],
+  links: [
+    ["entry", "out", "d1", "in"],
+    ["d1", "next", "end", "in"],
+  ],
+} as const;
+
+describe("authoring markdown", () => {
+  it("parses scene frontmatter", () => {
+    const doc = parseSceneMarkdown("---\nid: prologue\ntitle: 序章\nexits: [continue, retry]\n---\n\n# Goal\nMeet Alice.\n", "prologue");
+    expect(doc).toEqual({ id: "prologue", title: "序章", exits: ["continue", "retry"], body: "# Goal\nMeet Alice.\n" });
+  });
+
+  it("rejects missing frontmatter", () => {
+    expect(() => parseSceneMarkdown("# no frontmatter\n")).toThrow(/frontmatter/);
+  });
+
+  it("rewrites context without touching the script body", () => {
+    const source = "---\nid: prologue\ntitle: 序章\n---\n\n<!-- gel-context -->\nold\n<!-- /gel-context -->\n\n# Script\nKeep this.\n";
+    const rewritten = rewriteContext(source, "neighbor: ending");
+    expect(rewritten).toContain("neighbor: ending");
+    expect(rewritten).toContain("# Script\nKeep this.\n");
+    expect(splitContext(parseScriptMarkdown(rewritten).body).body).toContain("Keep this.");
+  });
+});
+
+describe("authoring IR", () => {
+  it("accepts a terminal narration scene", () => {
+    expect(validateStoryIr({
+      format: "gel.story-ir",
+      formatVersion: 1,
+      entryScene: "prologue",
+      scenes: [validScene],
+      routes: {},
+    })).toEqual([]);
+  });
+
+  it("rejects a missing flow link", () => {
+    const diagnostics = validateSceneIrFile({
+      format: "gel.scene-ir",
+      formatVersion: 1,
+      ...validScene,
+      links: [["entry", "out", "d1", "in"]],
+    });
+    expect(diagnostics.some((item) => item.code === "missing_flow_link")).toBe(true);
+  });
+
+  it("rejects dialogue with a speaker", () => {
+    const diagnostics = validateSceneIrFile({
+      format: "gel.scene-ir",
+      formatVersion: 1,
+      ...validScene,
+      nodes: [
+        { id: "d1", type: "gel.dialogue", text: "Hi", speaker: "alice" },
+        { id: "end", type: "gel.end_story" },
+      ],
+    });
+    expect(diagnostics.some((item) => item.code === "unsupported_speaker")).toBe(true);
+  });
+
+  it("rejects unsupported node types", () => {
+    const diagnostics = validateSceneIrFile({
+      format: "gel.scene-ir",
+      formatVersion: 1,
+      sceneId: "prologue",
+      nodes: [{ id: "s1", type: "gel.stage" }],
+      links: [],
+    });
+    expect(diagnostics.some((item) => item.code === "unsupported_node_type")).toBe(true);
+  });
+});
+
+describe("authoring workspace", () => {
+  it("inits and validates a directory", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-"));
+    const inited = await initAuthoring(dir);
+    expect(inited.ok).toBe(true);
+    expect(await readFile(join(dir, "outline.md"), "utf8")).toContain("Untitled Story");
+    const validated = await validateAuthoring(dir);
+    expect(validated.ok).toBe(true);
+    expect(validated.scenes).toEqual([]);
+  });
+
+  it("reports invalid scene files during validate", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "prologue.md"), "# missing frontmatter\n", "utf8");
+    const validated = await validateAuthoring(dir);
+    expect(validated.ok).toBe(false);
+    expect(validated.diagnostics[0].code).toBe("missing_frontmatter");
+  });
+});
+
+describe("author CLI", () => {
+  it("runs init through authorMain", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-cli-"));
+    const code = await authorMain(["init", dir]);
+    expect(code).toBe(0);
+    const status = JSON.parse(await readFile(join(dir, "status.json"), "utf8")) as { state: string; ok: boolean };
+    expect(status).toMatchObject({ state: "done", ok: true });
+  });
+});

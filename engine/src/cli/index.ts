@@ -3,10 +3,12 @@ import { DirectoryFileSystem } from "../filesystem";
 import { PackageLoader } from "../package";
 import { DEFAULT_LUA_SCENE_INSTRUCTION_LIMIT, StoryRunner } from "../scene";
 import type { LuaRequest } from "../lua";
+import { authorMain, printAuthorUsage } from "../author/cli";
 
 /** Small development CLI for validating and smoke-running Runtime Packages. */
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   const command = argv[0];
+  if (command === "author") return authorMain(argv.slice(1));
   const packageDirectory = argv[1];
   if ((command !== "validate" && command !== "run") || packageDirectory === undefined || argv.includes("--help")) {
     printUsage();
@@ -60,6 +62,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
 function printUsage(): void {
   console.error("Usage: gel-engine validate <package-dir>");
   console.error("       gel-engine run <package-dir> --auto");
+  printAuthorUsage();
 }
 
 function formatError(error: unknown): string {
