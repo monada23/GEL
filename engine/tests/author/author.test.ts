@@ -131,6 +131,40 @@ describe("scene generation", () => {
     expect(await readFile(join(dir, "scenes", "prologue.md"), "utf8")).toContain("# Goal");
   });
 
+  it("streams scene JSONL into markdown files as lines complete", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-scenes-stream-"));
+    await initAuthoring(dir);
+    const { generateScenes } = await import("../../src/author/stages");
+    const result = await generateScenes(dir, {
+      completeJson: async () => ({ scenes: [] }),
+      stream: async (_system, _user, onDelta) => {
+        const text = `${JSON.stringify({ id: "prologue", title: "序章", exits: ["continue"], body: "# Goal\\nArrive." })}\n${JSON.stringify({ id: "ending", title: "结局", exits: [], body: "# Goal\\nEnd." })}\n`;
+        onDelta(text);
+        return text;
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(result.scenes).toEqual(["prologue", "ending"]);
+    expect(await readFile(join(dir, "scenes", "prologue.md"), "utf8")).toContain("# Goal");
+    expect(await readFile(join(dir, "review", "preview.md"), "utf8")).toContain("id: prologue");
+  });
+
+  it("streams a script body into the markdown file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-script-stream-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "prologue.md"), "---\nid: prologue\ntitle: 序章\n---\n\n# Goal\nStart.\n", "utf8");
+    const { generateScripts } = await import("../../src/author/stages");
+    const result = await generateScripts(dir, "prologue", {
+      completeJson: async () => ({ id: "prologue", title: "序章", body: "unused" }),
+      stream: async (_system, _user, onDelta) => {
+        onDelta("# Script\nThe station is quiet.");
+        return "# Script\nThe station is quiet.";
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(await readFile(join(dir, "scripts", "prologue.md"), "utf8")).toContain("The station is quiet.");
+  });
+
   it("scripts scenes in parallel and keeps successes when one fails", async () => {
     const dir = await mkdtemp(join(tmpdir(), "gel-author-scripts-"));
     await initAuthoring(dir);
