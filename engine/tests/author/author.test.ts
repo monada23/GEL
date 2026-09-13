@@ -115,3 +115,19 @@ describe("author CLI", () => {
     expect(status).toMatchObject({ state: "done", ok: true });
   });
 });
+
+describe("scene generation", () => {
+  it("writes scene markdown from a mock LLM", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-scenes-"));
+    await initAuthoring(dir);
+    const { generateScenes } = await import("../../src/author/stages");
+    const result = await generateScenes(dir, {
+      completeJson: async () => ({
+        scenes: [{ id: "prologue", title: "序章", exits: ["continue"], body: "# Goal\nArrive." }],
+      }),
+    });
+    expect(result.ok).toBe(true);
+    expect(result.scenes).toEqual(["prologue"]);
+    expect(await readFile(join(dir, "scenes", "prologue.md"), "utf8")).toContain("# Goal");
+  });
+});
