@@ -238,22 +238,18 @@ describe("scene generation", () => {
     await writeFile(join(dir, "scenes", "prologue.md"), "---\nid: prologue\ntitle: 序章\n---\n\n# Goal\nStart.\n", "utf8");
     await writeFile(join(dir, "scripts", "prologue.md"), "---\nid: prologue\ntitle: 序章\n---\n\n# Script\nQuiet station.\n", "utf8");
     const { generateIr } = await import("../../src/author/stages");
-    const story = {
-      format: "gel.story-ir",
-      formatVersion: 1,
-      entryScene: "prologue",
-      scenes: [{
-        sceneId: "prologue",
-        title: "序章",
-        nodes: [
-          { id: "d1", type: "gel.dialogue", text: "The station is quiet." },
-          { id: "end", type: "gel.end_story" },
-        ],
-        links: [["entry", "out", "d1", "in"], ["d1", "next", "end", "in"]],
-      }],
-      routes: {},
-    };
-    const result = await generateIr(dir, undefined, { completeJson: async () => story });
+    const result = await generateIr(dir, undefined, {
+      completeJson: async (system) => {
+        if (system.includes("story graph")) return { entryScene: "prologue", routes: {} };
+        return {
+          nodes: [
+            { id: "d1", type: "gel.dialogue", text: "The station is quiet." },
+            { id: "end", type: "gel.end_story" },
+          ],
+          links: [["entry", "out", "d1", "in"], ["d1", "next", "end", "in"]],
+        };
+      },
+    });
     expect(result.ok).toBe(true);
     expect(JSON.parse(await readFile(join(dir, "ir", "story.json"), "utf8")).entryScene).toBe("prologue");
   });

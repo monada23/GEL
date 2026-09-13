@@ -165,10 +165,20 @@ export function pushIrEvent(state: IrFoldState, raw: unknown): void {
       if (state.entryScene.length > 0) throw new StreamError("duplicate story event");
       state.entryScene = event.entryScene;
       break;
-    case "scene":
+    case "scene": {
       finishScene();
-      state.current = { sceneId: event.sceneId, title: event.title, nodes: [], links: [], ids: new Set(["entry"]) };
+      const index = state.scenes.findIndex((scene) => scene.sceneId === event.sceneId);
+      if (index >= 0) {
+        const prev = state.scenes[index];
+        state.scenes.splice(index, 1);
+        const ids = new Set<string>(["entry"]);
+        for (const node of prev.nodes) ids.add(node.id);
+        state.current = { sceneId: prev.sceneId, title: event.title ?? prev.title, nodes: [...prev.nodes], links: [...prev.links], ids };
+      } else {
+        state.current = { sceneId: event.sceneId, title: event.title, nodes: [], links: [], ids: new Set(["entry"]) };
+      }
       break;
+    }
     case "node":
       if (state.current === undefined) throw new StreamError("node event before scene");
       if (state.current.ids.has(event.id)) throw new StreamError(`Duplicate node '${event.id}'`);

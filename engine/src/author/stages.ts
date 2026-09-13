@@ -6,7 +6,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { authoringDirectory, readAssetTexts, readSceneFiles, readScriptFiles, writeStatus, writeText } from "./workspace";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { consumeJsonLines, emptyIrFold, finishIrFold, partialJsonString, partialJsonStringArray, pushIrEvent, StreamError } from "./stream";
+import { consumeJsonLines, emptyIrFold, finishIrFold, parseIrEvent, partialJsonString, partialJsonStringArray, pushIrEvent, StreamError } from "./stream";
 
 const SCENE_SYSTEM = `You plan Galgame scenes for GEL.
 Return JSON only: {"scenes":[{"id":"prologue","title":"序章","exits":["continue"],"body":"..."}]}.
@@ -173,33 +173,52 @@ function groupFindings(findings: readonly ReviewFinding[]): Map<string, ReviewFi
   return grouped;
 }
 
-const IR_SYSTEM = `Convert GEL scene scripts into IR events.
-Emit one JSON object per line, no markdown fences.
-Start with {"op":"story","entryScene":"..."}.
-Then for each scene {"op":"scene","sceneId":"...","title":"..."}, then node and link events, then {"op":"route","from":"...","exit":"...","to":"..."}.
-Finish with {"op":"done"}.
-Node events: {"op":"node","id":"d1","type":"gel.dialogue","text":"..."}.
-Link events: {"op":"link","from":["entry","out"],"to":["d1","in"]}.
+const IR_GRAPH_SYSTEM = `You lay out a GEL story graph.
+Emit one JSON object per line, no markdown fences, in this exact order:
+1. {"op":"story","entryScene":"<id>"} — id must be one of the given scenes
+2. {"op":"route","from":"<scene>","exit":"<exit>","to":"<scene>"} — one per listed exit
+3. {"op":"done"}
+Rules:
+- Do not emit scene, node, or link. Scene cards already exist.
+- Do not invent scene ids or extra exits.
+- Every listed exit must have exactly one route.
+- entryScene is the first playable scene.`;
+
+const IR_SCENE_SYSTEM = `You fill one GEL scene inner graph from its script.
+Emit one JSON object per line, no markdown fences, in this exact order:
+1. Emit every node before any link. Never link to an id you have not emitted.
+2. {"op":"node","id":"d1","type":"gel.dialogue","text":"..."}
+3. {"op":"link","from":["entry","out"],"to":["d1","in"]} — the first link must leave entry
+4. Every required exit is {"op":"node","id":"<exit>","type":"gel.graph_output","interfaceId":"<exit>"} plus a link into it.
+Do not emit story, scene, route, or done. Do not use speakers or Lua.
 Allowed types: gel.dialogue (no speaker), gel.choice, gel.boolean, gel.if, gel.graph_output, gel.end_story.
-Links may only target ids already emitted. Use entry as the scene entry id.`;
+Local ids match ^[a-z][a-z0-9_-]*$. Use entry as the scene entry id.`;
+
+const IR_GRAPH_JSON_SYSTEM = `You lay out a GEL story graph.
+Return JSON only: {"entryScene":"prologue","routes":{"prologue":{"enter":"library"}}}.
+Use only given scene ids. Every listed exit needs a route. No nodes.`;
+
+const IR_SCENE_JSON_SYSTEM = `You fill one GEL scene from its script.
+Return JSON only: {"nodes":[{"id":"d1","type":"gel.dialogue","text":"..."},{"id":"end","type":"gel.end_story"}],"links":[["entry","out","d1","in"],["d1","next","end","in"]]}.
+First link must leave entry. Required exits are gel.graph_output nodes with that interfaceId. No speakers.`;
+
+const IR_SCENE_CONCURRENCY = 3;
 
 export async function generateIr(directory: string, sceneId?: string, client?: LlmClient): Promise<AuthorResult> {
   const dir = authoringDirectory(directory);
   try {
     const llm = client ?? await clientForAgent("ir");
+    const outline = parseOutline(await readFile(join(dir, "outline.md"), "utf8"));
     const scenes = await readSceneFiles(dir);
     const scripts = await readScriptFiles(dir);
     const selected = sceneId === undefined ? scripts : scripts.filter((script) => script.id === sceneId);
     if (selected.length === 0) {
       return { ok: false, stage: "ir", directory: dir, diagnostics: [{ code: "missing_scene", message: "No scripts to compile into IR." }] };
     }
-    const user = selected.map((script) => {
-      const card = scenes.find((scene) => scene.id === script.id);
-      return `# ${script.id}\n${card ? card.body : ""}\n\n${script.body}`;
-    }).join("\n\n");
+    const prefix = packStoryPrefix(outline.title, outline.body, scenes, "");
     const payload = llm.stream === undefined
-      ? await completeWithRetry(llm, IR_SYSTEM, user)
-      : await generateIrStream(dir, llm, user);
+      ? await generateIrComplete(llm, prefix, selected, scenes)
+      : await generateIrStream(dir, llm, prefix, selected, scenes);
     const { validateStoryIr } = await import("./ir");
     const diagnostics = validateStoryIr(payload);
     if (diagnostics.length > 0) return { ok: false, stage: "ir", directory: dir, diagnostics };
@@ -216,6 +235,191 @@ export async function generateIr(directory: string, sceneId?: string, client?: L
   }
 }
 
+async function generateIrComplete(client: LlmClient, prefix: string, selected: readonly ScriptMarkdown[], scenes: readonly SceneMarkdown[]): Promise<unknown> {
+  const graph = parseGraphPayload(await completeWithRetry(client, IR_GRAPH_JSON_SYSTEM, irGraphUser(prefix, selected, scenes)));
+  const interiors = new Map<string, { nodes: unknown[]; links: unknown[] }>();
+  await mapPool(selected, IR_SCENE_CONCURRENCY, async (script) => {
+    interiors.set(script.id, parseSceneInterior(await completeWithRetry(client, IR_SCENE_JSON_SYSTEM, irSceneUser(prefix, script, scenes))));
+  });
+  return {
+    format: "gel.story-ir",
+    formatVersion: 1,
+    entryScene: graph.entryScene,
+    scenes: selected.map((script) => {
+      const interior = interiors.get(script.id) ?? { nodes: [], links: [] };
+      return { sceneId: script.id, title: script.title, nodes: interior.nodes, links: interior.links };
+    }),
+    routes: graph.routes,
+  };
+}
+
+async function generateIrStream(directory: string, client: LlmClient, prefix: string, selected: readonly ScriptMarkdown[], scenes: readonly SceneMarkdown[]): Promise<unknown> {
+  const relative = "ir/stream.jsonl";
+  const jsonl = join(directory, relative);
+  await writeText(directory, relative, "");
+  await writeStatus(directory, { state: "running", stage: "ir", ok: true, message: "Laying out scenes", diagnostics: [] });
+  const state = emptyIrFold();
+  const writeEvent = (value: unknown): void => {
+    appendFileSync(jsonl, `${JSON.stringify(value)}\n`);
+  };
+  for (const script of selected) {
+    const event = { op: "scene", sceneId: script.id, title: script.title };
+    pushIrEvent(state, event);
+    writeEvent(event);
+  }
+  const accepted: unknown[] = [];
+  await runJsonlStream(client, IR_GRAPH_SYSTEM, irGraphUser(prefix, selected, scenes), (value) => {
+    const event = parseIrEvent(value);
+    if (event.op === "node" || event.op === "link" || event.op === "scene") {
+      throw new StreamError(`graph step cannot emit ${event.op}`);
+    }
+    pushIrEvent(state, value);
+    accepted.push(value);
+    if (event.op === "story") writeEvent(event);
+  }, () => state.done, () => accepted.map((item) => JSON.stringify(item)).join("\n"), "done-op", directory);
+  state.done = false;
+  const interiors = new Map<string, unknown[]>();
+  await mapPool(selected, IR_SCENE_CONCURRENCY, async (script) => {
+    interiors.set(script.id, await generateSceneInteriorStream(client, prefix, script, scenes, directory));
+  });
+  for (const script of selected) {
+    for (const event of interiors.get(script.id) ?? []) {
+      pushIrEvent(state, event);
+      writeEvent(event);
+    }
+  }
+  for (const [from, mapping] of Object.entries(state.routes)) {
+    for (const [exit, to] of Object.entries(mapping)) {
+      writeEvent({ op: "route", from, exit, to });
+    }
+  }
+  pushIrEvent(state, { op: "done" });
+  writeEvent({ op: "done" });
+  return finishIrFold(state);
+}
+
+async function generateSceneInteriorStream(client: LlmClient, prefix: string, script: ScriptMarkdown, scenes: readonly SceneMarkdown[], directory: string): Promise<unknown[]> {
+  const events: unknown[] = [{ op: "scene", sceneId: script.id, title: script.title }];
+  const ids = new Set<string>(["entry"]);
+  const accepted: unknown[] = [];
+  let finished = false;
+  await runJsonlStream(client, IR_SCENE_SYSTEM, irSceneUser(prefix, script, scenes), (value) => {
+    const event = parseIrEvent(value);
+    if (event.op === "done") {
+      finished = true;
+      return;
+    }
+    if (event.op !== "node" && event.op !== "link") throw new StreamError(`scene step cannot emit ${event.op}`);
+    if (event.op === "node") {
+      if (ids.has(event.id)) throw new StreamError(`Duplicate node '${event.id}'`);
+      ids.add(event.id);
+    } else if (!ids.has(event.from[0]) || !ids.has(event.to[0])) {
+      throw new StreamError(`Link target must already exist (${event.from[0]} -> ${event.to[0]})`);
+    }
+    events.push(value);
+    accepted.push(value);
+  }, () => finished, () => accepted.map((item) => JSON.stringify(item)).join("\n"), "stream-end", directory);
+  if (ids.size <= 1) throw new StreamError(`Scene '${script.id}' emitted no nodes`);
+  return events;
+}
+
+async function runJsonlStream(
+  client: LlmClient,
+  system: string,
+  user: string,
+  onObject: (value: unknown) => void,
+  isDone: () => boolean,
+  acceptedText: () => string,
+  until: "done-op" | "stream-end",
+  directory: string,
+): Promise<void> {
+  const limit = await irErrorLimit();
+  let extra: { role: "assistant" | "user"; content: string }[] = [];
+  let consecutive = 0;
+  while (!isDone()) {
+    let pending = "";
+    let halt: Error | undefined;
+    await client.stream!(system, user, (delta) => {
+      if (halt !== undefined) return;
+      pending += delta;
+      try {
+        pending = consumeJsonLines(pending, (value) => {
+          if (halt !== undefined) return;
+          try {
+            onObject(value);
+            consecutive = 0;
+          } catch (error) {
+            halt = error instanceof Error ? error : new Error(String(error));
+          }
+        });
+      } catch (error) {
+        halt = error instanceof Error ? error : new Error(String(error));
+        pending = "";
+      }
+    }, extra);
+    if (halt === undefined && pending.trim().length > 0) {
+      try {
+        onObject(JSON.parse(pending.trim()));
+        consecutive = 0;
+      } catch (error) {
+        halt = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    if (isDone()) break;
+    if (halt === undefined) {
+      if (until === "stream-end") break;
+      halt = new StreamError("stream ended before done");
+    }
+    consecutive += 1;
+    if (consecutive >= limit) {
+      throw new StreamError(`IR generation stopped after ${limit} consecutive errors: ${halt.message}`);
+    }
+    extra = [
+      { role: "assistant", content: acceptedText() },
+      { role: "user", content: `Rejected and discarded: ${halt.message}. Continue with the next valid IR event(s) only. Do not repeat accepted events.` },
+    ];
+    await writeStatus(directory, { state: "running", stage: "ir", ok: true, message: `IR error (${consecutive}/${limit}): ${halt.message}`, diagnostics: [] });
+  }
+}
+
+function irGraphUser(prefix: string, selected: readonly ScriptMarkdown[], scenes: readonly SceneMarkdown[]): string {
+  const cards = selected.map((script) => {
+    const card = scenes.find((scene) => scene.id === script.id);
+    return `## ${script.id} (${script.title})\nexits: ${card?.exits.join(", ") || "(none)"}`;
+  }).join("\n");
+  return `${prefix}\n\n# Connect these scenes\n${cards}\n\nEmit story, then one route per listed exit, then done.`;
+}
+
+function irSceneUser(prefix: string, script: ScriptMarkdown, scenes: readonly SceneMarkdown[]): string {
+  const card = scenes.find((scene) => scene.id === script.id);
+  const exits = card?.exits.join(", ") || "(none)";
+  return `${prefix}\n\n# Fill scene ${script.id}\nRequired graph_output interfaceIds: ${exits}\n\n# Script\n${script.body}\n\nEmit nodes first, then links. First link must leave entry.`;
+}
+
+function parseGraphPayload(payload: unknown): { entryScene: string; routes: Record<string, Record<string, string>> } {
+  if (payload === null || typeof payload !== "object") throw new StreamError("graph payload must be an object");
+  const record = payload as Record<string, unknown>;
+  if (typeof record.entryScene !== "string") throw new StreamError("graph.entryScene required");
+  if (record.routes === undefined) return { entryScene: record.entryScene, routes: {} };
+  if (record.routes === null || typeof record.routes !== "object" || Array.isArray(record.routes)) throw new StreamError("graph.routes must be an object");
+  const routes: Record<string, Record<string, string>> = {};
+  for (const [from, mapping] of Object.entries(record.routes as Record<string, unknown>)) {
+    if (mapping === null || typeof mapping !== "object" || Array.isArray(mapping)) throw new StreamError(`routes.${from} must be an object`);
+    routes[from] = {};
+    for (const [exit, to] of Object.entries(mapping as Record<string, unknown>)) {
+      if (typeof to !== "string") throw new StreamError(`routes.${from}.${exit} must be a scene id`);
+      routes[from][exit] = to;
+    }
+  }
+  return { entryScene: record.entryScene, routes };
+}
+
+function parseSceneInterior(payload: unknown): { nodes: unknown[]; links: unknown[] } {
+  if (payload === null || typeof payload !== "object") throw new StreamError("scene IR payload must be an object");
+  const record = payload as Record<string, unknown>;
+  if (!Array.isArray(record.nodes) || !Array.isArray(record.links)) throw new StreamError("scene IR requires nodes and links arrays");
+  return { nodes: record.nodes, links: record.links };
+}
 export async function completeWithRetry(client: LlmClient, system: string, user: string, onDelta?: (text: string) => void): Promise<unknown> {
   const once = async (): Promise<unknown> => {
     if (client.stream !== undefined) {
@@ -231,67 +435,7 @@ export async function completeWithRetry(client: LlmClient, system: string, user:
   }
 }
 
-async function generateIrStream(directory: string, client: LlmClient, user: string): Promise<unknown> {
-  const relative = "ir/stream.jsonl";
-  await writeText(directory, relative, "");
-  await writeStatus(directory, { state: "running", stage: "ir", ok: true, message: "", diagnostics: [], previewFile: relative });
-  const limit = await irErrorLimit();
-  const state = emptyIrFold();
-  let extra: { role: "assistant" | "user"; content: string }[] = [];
-  let consecutive = 0;
-  while (!state.done) {
-    let pending = "";
-    let halt: Error | undefined;
-    await client.stream!(IR_SYSTEM, user, (delta) => {
-      if (halt !== undefined) return;
-      pending += delta;
-      try {
-        pending = consumeJsonLines(pending, (value) => {
-          if (halt !== undefined) return;
-          try {
-            pushIrEvent(state, value);
-            appendFileSync(join(directory, relative), `${JSON.stringify(value)}\n`);
-            consecutive = 0;
-          } catch (error) {
-            halt = error instanceof Error ? error : new Error(String(error));
-          }
-        });
-      } catch (error) {
-        halt = error instanceof Error ? error : new Error(String(error));
-        pending = "";
-      }
-    }, extra);
-    if (halt === undefined && pending.trim().length > 0) {
-      try {
-        const value: unknown = JSON.parse(pending.trim());
-        pushIrEvent(state, value);
-        appendFileSync(join(directory, relative), `${JSON.stringify(value)}\n`);
-        consecutive = 0;
-      } catch (error) {
-        halt = error instanceof Error ? error : new Error(String(error));
-      }
-    }
-    if (state.done) break;
-    if (halt === undefined) halt = new StreamError("stream ended before done");
-    consecutive += 1;
-    if (consecutive >= limit) {
-      throw new StreamError(`IR generation stopped after ${limit} consecutive errors: ${halt.message}`);
-    }
-    extra = [
-      { role: "assistant", content: state.events.map((event) => JSON.stringify(event)).join("\n") },
-      { role: "user", content: `Rejected and discarded: ${halt.message}. Continue with the next valid IR event(s) only. Do not repeat accepted events.` },
-    ];
-    await writeStatus(directory, {
-      state: "running",
-      stage: "ir",
-      ok: true,
-      message: `IR error (${consecutive}/${limit}): ${halt.message}`,
-      diagnostics: [],
-      previewFile: relative,
-    });
-  }
-  return finishIrFold(state);
- }
+ 
 
 async function irErrorLimit(): Promise<number> {
   try {
