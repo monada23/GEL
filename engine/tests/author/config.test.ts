@@ -74,7 +74,7 @@ describe("author config parse", () => {
 describe("author config files", () => {
   it("builds a client from GEL_AUTHOR_CONFIG", async () => {
     const dir = await mkdtemp(join(tmpdir(), "gel-author-config-"));
-    const path = join(dir, "author.config.json");
+    const path = join(dir, "author.json");
     await writeFile(path, `${JSON.stringify(valid)}\n`, "utf8");
     process.env.GEL_AUTHOR_CONFIG = path;
     const client = await clientForAgent("review");
@@ -87,7 +87,7 @@ describe("author config files", () => {
 
   it("writes a default config once", async () => {
     const dir = await mkdtemp(join(tmpdir(), "gel-author-config-init-"));
-    const path = join(dir, "author.config.json");
+    const path = join(dir, "author.json");
     process.env.GEL_AUTHOR_CONFIG = path;
     expect(await authorMain(["config"])).toBe(0);
     const first = await readFile(path, "utf8");

@@ -60,7 +60,7 @@ export function authorConfigPath(): string {
   if (override) return override;
   const xdg = process.env.XDG_CONFIG_HOME?.trim();
   const root = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config");
-  return join(root, "gel", "author.config.json");
+  return join(root, "gel", "author.json");
 }
 
 export function parseAuthorConfig(value: unknown, path: string): AuthorConfig {
