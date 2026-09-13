@@ -1,7 +1,7 @@
 import { LlmError, defaultLlmClient, type LlmClient } from "./llm";
 import { MarkdownParseError, parseOutline, serializeSceneMarkdown, serializeScriptMarkdown } from "./markdown";
 import type { AuthorDiagnostic, AuthorResult, SceneMarkdown, ScriptMarkdown } from "./types";
-import { authoringDirectory, readAssetTexts, readSceneFiles, writeText } from "./workspace";
+import { authoringDirectory, readAssetTexts, readSceneFiles, readScriptFiles, writeText } from "./workspace";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -39,7 +39,7 @@ Keep the user-facing script in body; context is supplied separately.`;
 
 const SCRIPT_CONCURRENCY = 3;
 
-export async function generateScripts(directory: string, sceneId?: string, client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
+export async function generateScripts(directory: string, sceneId?: string, client: LlmClient = defaultLlmClient(), focus = ""): Promise<AuthorResult> {
   const dir = authoringDirectory(directory);
   const diagnostics: AuthorDiagnostic[] = [];
   const written: string[] = [];
@@ -53,7 +53,7 @@ export async function generateScripts(directory: string, sceneId?: string, clien
     }
     await mapPool(targets, SCRIPT_CONCURRENCY, async (scene) => {
       try {
-        const context = packSceneContext(outline.title, outline.body, scene, scenes, assets);
+        const context = packSceneContext(outline.title, outline.body, scene, scenes, assets, focus);
         const payload = await completeWithRetry(client, SCRIPT_SYSTEM, `${context}\n\n# Write script for scene ${scene.id}`);
         const script = parseScriptPayload(payload, scene);
         await writeText(dir, `scripts/${script.id}.md`, serializeScriptMarkdown({ ...script, context }));
@@ -68,8 +68,80 @@ export async function generateScripts(directory: string, sceneId?: string, clien
   }
 }
 
-export async function reviewScripts(directory: string, _client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
-  return unavailable("review", directory);
+const REVIEW_SYSTEM = `You review GEL galgame scripts for out-of-character writing and logic holes.
+Return JSON only: {"findings":[{"sceneId":"prologue","severity":"error","kind":"ooc","excerpt":"...","suggestion":"..."}]}.
+kind must be ooc or logic. severity must be error or warning.
+If the scripts are consistent, return {"findings":[]}. Do not rewrite the scripts here.`;
+
+const MAX_REVIEW_ROUNDS = 2;
+
+export async function reviewScripts(directory: string, client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
+  const dir = authoringDirectory(directory);
+  try {
+    let findings: ReviewFinding[] = [];
+    for (let round = 1; round <= MAX_REVIEW_ROUNDS + 1; round += 1) {
+      findings = await collectFindings(dir, client);
+      await writeText(dir, "review/findings.json", `${JSON.stringify({ round, findings }, null, 2)}\n`);
+      if (findings.length === 0) {
+        return { ok: true, stage: "review", directory: dir, diagnostics: [], findings, round };
+      }
+      if (round > MAX_REVIEW_ROUNDS) break;
+      const byScene = groupFindings(findings);
+      for (const [sceneId, sceneFindings] of byScene) {
+        const focus = sceneFindings.map((item) => `- ${item.kind} (${item.severity}): ${item.excerpt} -> ${item.suggestion}`).join("\n");
+        const patched = await generateScripts(dir, sceneId, client, `# Review notes\n${focus}`);
+        if (!patched.ok) return { ...patched, findings, round };
+      }
+    }
+    const errors = findings.filter((item) => item.severity === "error").map((item) => ({ code: "review_finding", message: `${item.sceneId}: ${item.kind} ${item.excerpt}`, path: `scripts/${item.sceneId}.md` }));
+    return { ok: errors.length === 0, stage: "review", directory: dir, diagnostics: errors, findings, round: MAX_REVIEW_ROUNDS + 1 };
+  } catch (error) {
+    return { ok: false, stage: "review", directory: dir, diagnostics: [asDiagnostic(error)] };
+  }
+}
+
+interface ReviewFinding {
+  sceneId: string;
+  severity: "error" | "warning";
+  kind: "ooc" | "logic";
+  excerpt: string;
+  suggestion: string;
+}
+
+async function collectFindings(directory: string, client: LlmClient): Promise<ReviewFinding[]> {
+  const outline = parseOutline(await readFile(join(directory, "outline.md"), "utf8"));
+  const scenes = await readSceneFiles(directory);
+  const scripts = await readScriptFiles(directory);
+  if (scripts.length === 0) throw new MarkdownParseError("missing_scene", "No scripts to review.");
+  const user = [`# Outline\n${outline.body}`, `# Scenes\n${scenes.map((scene) => `## ${scene.id}\n${scene.body}`).join("\n\n")}`, `# Scripts\n${scripts.map((script) => `## ${script.id}\n${script.body}`).join("\n\n")}`].join("\n\n");
+  const payload = await completeWithRetry(client, REVIEW_SYSTEM, user);
+  return parseFindings(payload);
+}
+
+function parseFindings(payload: unknown): ReviewFinding[] {
+  if (payload === null || typeof payload !== "object" || !Array.isArray((payload as { findings?: unknown }).findings)) {
+    throw new MarkdownParseError("invalid_llm_json", "Review payload must be {findings: [...]}");
+  }
+  const findings: ReviewFinding[] = [];
+  for (const item of (payload as { findings: unknown[] }).findings) {
+    if (item === null || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (typeof record.sceneId !== "string" || typeof record.excerpt !== "string" || typeof record.suggestion !== "string") continue;
+    if (record.kind !== "ooc" && record.kind !== "logic") continue;
+    if (record.severity !== "error" && record.severity !== "warning") continue;
+    findings.push({ sceneId: record.sceneId, severity: record.severity, kind: record.kind, excerpt: record.excerpt, suggestion: record.suggestion });
+  }
+  return findings;
+}
+
+function groupFindings(findings: readonly ReviewFinding[]): Map<string, ReviewFinding[]> {
+  const grouped = new Map<string, ReviewFinding[]>();
+  for (const finding of findings) {
+    const list = grouped.get(finding.sceneId) ?? [];
+    list.push(finding);
+    grouped.set(finding.sceneId, list);
+  }
+  return grouped;
 }
 
 export async function generateIr(directory: string, _sceneId?: string, _client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {

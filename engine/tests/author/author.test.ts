@@ -153,4 +153,30 @@ describe("scene generation", () => {
     expect(await readFile(join(dir, "scripts", "prologue.md"), "utf8")).toContain("prologue line");
     expect(seen.some((user) => user.includes("Write script for scene prologue") && user.includes("ending: 结局"))).toBe(true);
   });
+
+  it("patches a script once and stops when review is clean", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-review-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "prologue.md"), "---\nid: prologue\ntitle: 序章\n---\n\n# Goal\nStart.\n", "utf8");
+    await writeFile(join(dir, "scripts", "prologue.md"), "---\nid: prologue\ntitle: 序章\n---\n\n# Script\nOld.\n", "utf8");
+    const { reviewScripts } = await import("../../src/author/stages");
+    let reviews = 0;
+    const result = await reviewScripts(dir, {
+      completeJson: async (system, user) => {
+        if (system.includes("review GEL")) {
+          reviews += 1;
+          if (reviews === 1) {
+            return { findings: [{ sceneId: "prologue", severity: "error", kind: "logic", excerpt: "Old", suggestion: "Say the station is quiet." }] };
+          }
+          return { findings: [] };
+        }
+        expect(user).toContain("Review notes");
+        return { id: "prologue", title: "序章", body: "# Script\nThe station is quiet." };
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(reviews).toBe(2);
+    expect(await readFile(join(dir, "scripts", "prologue.md"), "utf8")).toContain("station is quiet");
+    expect(await readFile(join(dir, "review", "findings.json"), "utf8")).toContain('"findings": []');
+  });
 });
