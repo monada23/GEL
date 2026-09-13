@@ -1,3 +1,5 @@
+import { loadAuthorConfig, resolveAgent, type AuthorAgent } from "./config";
+
 export interface LlmClient {
   completeJson(system: string, user: string): Promise<unknown>;
 }
@@ -11,19 +13,18 @@ export class LlmError extends Error {
   }
 }
 
-export function defaultLlmClient(): LlmClient {
-  return new OpenAiCompatibleClient();
-}
-
 export class OpenAiCompatibleClient implements LlmClient {
   public constructor(
-    private readonly apiKey = process.env.OPENAI_API_KEY ?? "",
-    private readonly baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, ""),
-    private readonly model = process.env.OPENAI_MODEL ?? "gpt-4o",
+    public readonly provider: string,
+    public readonly apiKey: string,
+    public readonly baseUrl: string,
+    public readonly model: string,
   ) {}
 
   public async completeJson(system: string, user: string): Promise<unknown> {
-    if (this.apiKey.trim().length === 0) throw new LlmError("missing_api_key", "OPENAI_API_KEY is required");
+    if (this.apiKey.trim().length === 0) {
+      throw new LlmError("missing_api_key", `Provider '${this.provider}' apiKey is empty`);
+    }
     const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
@@ -50,6 +51,12 @@ export class OpenAiCompatibleClient implements LlmClient {
       throw new LlmError("invalid_llm_json", error instanceof Error ? error.message : String(error));
     }
   }
+}
+
+export async function clientForAgent(agent: AuthorAgent): Promise<OpenAiCompatibleClient> {
+  const loaded = await loadAuthorConfig();
+  const resolved = resolveAgent(loaded.config, agent, loaded.path);
+  return new OpenAiCompatibleClient(resolved.provider, resolved.apiKey, resolved.baseUrl, resolved.model);
 }
 
 export function parseJsonPayload(text: string): unknown {

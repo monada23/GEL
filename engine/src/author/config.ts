@@ -1,0 +1,158 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+
+export const AUTHOR_AGENTS = ["scenes", "scripts", "review", "ir"] as const;
+export type AuthorAgent = (typeof AUTHOR_AGENTS)[number];
+
+export class ConfigError extends Error {
+  public readonly code: "missing_config" | "invalid_config";
+  public readonly path: string;
+  public constructor(code: ConfigError["code"], message: string, path: string) {
+    super(message);
+    this.name = "ConfigError";
+    this.code = code;
+    this.path = path;
+  }
+}
+
+export interface AuthorProvider {
+  baseUrl: string;
+  apiKey: string;
+}
+
+export interface AuthorAgentRef {
+  provider: string;
+  model: string;
+}
+
+export interface AuthorConfig {
+  providers: Record<string, AuthorProvider>;
+  agents: Record<AuthorAgent, AuthorAgentRef>;
+}
+
+export const DEFAULT_AUTHOR_CONFIG: AuthorConfig = {
+  providers: {
+    openai: {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "",
+    },
+  },
+  agents: {
+    scenes: { provider: "openai", model: "gpt-4o" },
+    scripts: { provider: "openai", model: "gpt-4o" },
+    review: { provider: "openai", model: "gpt-4o" },
+    ir: { provider: "openai", model: "gpt-4o" },
+  },
+};
+
+export function authorConfigPath(): string {
+  const override = process.env.GEL_AUTHOR_CONFIG?.trim();
+  if (override) return override;
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  const root = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config");
+  return join(root, "gel", "author.config.json");
+}
+
+export function parseAuthorConfig(value: unknown, path: string): AuthorConfig {
+  if (!isRecord(value)) throw new ConfigError("invalid_config", `Author config must be an object: ${path}`, path);
+  const extra = Object.keys(value).filter((key) => key !== "providers" && key !== "agents");
+  if (extra.length > 0) throw new ConfigError("invalid_config", `Unknown config field '${extra[0]}': ${path}`, path);
+  if (!isRecord(value.providers) || !isRecord(value.agents)) {
+    throw new ConfigError("invalid_config", `providers and agents must be objects: ${path}`, path);
+  }
+  const providers: Record<string, AuthorProvider> = {};
+  for (const [name, raw] of Object.entries(value.providers)) {
+    if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
+      throw new ConfigError("invalid_config", `Invalid provider id '${name}': ${path}`, path);
+    }
+    if (!isRecord(raw)) throw new ConfigError("invalid_config", `Provider '${name}' must be an object: ${path}`, path);
+    const providerExtra = Object.keys(raw).filter((key) => key !== "baseUrl" && key !== "apiKey");
+    if (providerExtra.length > 0) {
+      throw new ConfigError("invalid_config", `Unknown field '${providerExtra[0]}' on provider '${name}': ${path}`, path);
+    }
+    if (typeof raw.baseUrl !== "string" || raw.baseUrl.trim().length === 0) {
+      throw new ConfigError("invalid_config", `Provider '${name}' baseUrl is required: ${path}`, path);
+    }
+    if (typeof raw.apiKey !== "string") {
+      throw new ConfigError("invalid_config", `Provider '${name}' apiKey must be a string: ${path}`, path);
+    }
+    providers[name] = { baseUrl: raw.baseUrl.replace(/\/$/, ""), apiKey: raw.apiKey };
+  }
+  if (Object.keys(providers).length === 0) {
+    throw new ConfigError("invalid_config", `At least one provider is required: ${path}`, path);
+  }
+  const agents = {} as Record<AuthorAgent, AuthorAgentRef>;
+  for (const agent of AUTHOR_AGENTS) {
+    const raw = value.agents[agent];
+    if (!isRecord(raw)) throw new ConfigError("invalid_config", `Agent '${agent}' is required: ${path}`, path);
+    const agentExtra = Object.keys(raw).filter((key) => key !== "provider" && key !== "model");
+    if (agentExtra.length > 0) {
+      throw new ConfigError("invalid_config", `Unknown field '${agentExtra[0]}' on agent '${agent}': ${path}`, path);
+    }
+    if (typeof raw.provider !== "string" || providers[raw.provider] === undefined) {
+      throw new ConfigError("invalid_config", `Agent '${agent}' provider '${String(raw.provider)}' is unknown: ${path}`, path);
+    }
+    if (typeof raw.model !== "string" || raw.model.trim().length === 0) {
+      throw new ConfigError("invalid_config", `Agent '${agent}' model is required: ${path}`, path);
+    }
+    agents[agent] = { provider: raw.provider, model: raw.model };
+  }
+  const unknownAgents = Object.keys(value.agents).filter((key) => !AUTHOR_AGENTS.includes(key as AuthorAgent));
+  if (unknownAgents.length > 0) {
+    throw new ConfigError("invalid_config", `Unknown agent '${unknownAgents[0]}': ${path}`, path);
+  }
+  return { providers, agents };
+}
+
+export async function loadAuthorConfig(): Promise<{ path: string; config: AuthorConfig }> {
+  const path = authorConfigPath();
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch {
+    throw new ConfigError("missing_config", `Author config not found at ${path}. Run gel-engine author config.`, path);
+  }
+  try {
+    return { path, config: parseAuthorConfig(JSON.parse(text), path) };
+  } catch (error) {
+    if (error instanceof ConfigError) throw error;
+    throw new ConfigError("invalid_config", `Author config is not JSON: ${path}`, path);
+  }
+}
+
+export function resolveAgent(
+  config: AuthorConfig,
+  agent: AuthorAgent,
+  path = authorConfigPath(),
+): AuthorProvider & { model: string; provider: string } {
+  const ref = config.agents[agent];
+  const provider = config.providers[ref.provider];
+  if (provider === undefined) {
+    throw new ConfigError("invalid_config", `Agent '${agent}' provider '${ref.provider}' is unknown: ${path}`, path);
+  }
+  return { ...provider, model: ref.model, provider: ref.provider };
+}
+
+export async function ensureAuthorConfig(): Promise<{
+  ok: true;
+  stage: "config";
+  path: string;
+  created: boolean;
+  message: string;
+  diagnostics: [];
+}> {
+  const path = authorConfigPath();
+  try {
+    await readFile(path, "utf8");
+    return { ok: true, stage: "config", path, created: false, message: path, diagnostics: [] };
+  } catch {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `${JSON.stringify(DEFAULT_AUTHOR_CONFIG, null, 2)}\n`, "utf8");
+    return { ok: true, stage: "config", path, created: true, message: path, diagnostics: [] };
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}

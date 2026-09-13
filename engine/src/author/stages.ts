@@ -1,4 +1,5 @@
-import { LlmError, defaultLlmClient, type LlmClient } from "./llm";
+import { ConfigError } from "./config";
+import { LlmError, clientForAgent, type LlmClient } from "./llm";
 import { MarkdownParseError, parseOutline, serializeSceneMarkdown, serializeScriptMarkdown } from "./markdown";
 import type { AuthorDiagnostic, AuthorResult, SceneMarkdown, ScriptMarkdown } from "./types";
 import { authoringDirectory, readAssetTexts, readSceneFiles, readScriptFiles, writeText } from "./workspace";
@@ -14,13 +15,14 @@ Rules:
 - keep the set small and playable
 - do not write Lua, node JSON, or character dialogue speakers`;
 
-export async function generateScenes(directory: string, client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
+export async function generateScenes(directory: string, client?: LlmClient): Promise<AuthorResult> {
   const dir = authoringDirectory(directory);
   try {
+    const llm = client ?? await clientForAgent("scenes");
     const outline = parseOutline(await readFile(join(dir, "outline.md"), "utf8"));
     const assets = await readAssetTexts(dir);
     const user = `# Title\n${outline.title}\n\n# Outline\n${outline.body}\n\n# Assets\n${assets || "(none)"}`;
-    const payload = await completeWithRetry(client, SCENE_SYSTEM, user);
+    const payload = await completeWithRetry(llm, SCENE_SYSTEM, user);
     const scenes = parseScenePayload(payload);
     for (const scene of scenes) {
       await writeText(dir, `scenes/${scene.id}.md`, serializeSceneMarkdown(scene));
@@ -39,11 +41,12 @@ Keep the user-facing script in body; context is supplied separately.`;
 
 const SCRIPT_CONCURRENCY = 3;
 
-export async function generateScripts(directory: string, sceneId?: string, client: LlmClient = defaultLlmClient(), focus = ""): Promise<AuthorResult> {
+export async function generateScripts(directory: string, sceneId?: string, client?: LlmClient, focus = ""): Promise<AuthorResult> {
   const dir = authoringDirectory(directory);
   const diagnostics: AuthorDiagnostic[] = [];
   const written: string[] = [];
   try {
+    const llm = client ?? await clientForAgent("scripts");
     const outline = parseOutline(await readFile(join(dir, "outline.md"), "utf8"));
     const scenes = await readSceneFiles(dir);
     const assets = await readAssetTexts(dir);
@@ -55,7 +58,7 @@ export async function generateScripts(directory: string, sceneId?: string, clien
     await mapPool(targets, SCRIPT_CONCURRENCY, async (scene) => {
       try {
         const context = packSceneContext(outline.title, outline.body, scene, scenes, assets, mergedFocus);
-        const payload = await completeWithRetry(client, SCRIPT_SYSTEM, `${context}\n\n# Write script for scene ${scene.id}`);
+        const payload = await completeWithRetry(llm, SCRIPT_SYSTEM, `${context}\n\n# Write script for scene ${scene.id}`);
         const script = parseScriptPayload(payload, scene);
         await writeText(dir, `scripts/${script.id}.md`, serializeScriptMarkdown({ ...script, context }));
         written.push(script.id);
@@ -76,12 +79,13 @@ If the scripts are consistent, return {"findings":[]}. Do not rewrite the script
 
 const MAX_REVIEW_ROUNDS = 2;
 
-export async function reviewScripts(directory: string, client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
+export async function reviewScripts(directory: string, client?: LlmClient): Promise<AuthorResult> {
   const dir = authoringDirectory(directory);
   try {
+    const reviewer = client ?? await clientForAgent("review");
     let findings: ReviewFinding[] = [];
     for (let round = 1; round <= MAX_REVIEW_ROUNDS + 1; round += 1) {
-      findings = await collectFindings(dir, client);
+      findings = await collectFindings(dir, reviewer);
       await writeText(dir, "review/findings.json", `${JSON.stringify({ round, findings }, null, 2)}\n`);
       if (findings.length === 0) {
         return { ok: true, stage: "review", directory: dir, diagnostics: [], findings, round };
@@ -150,9 +154,10 @@ Return JSON only with format gel.story-ir, formatVersion 1, entryScene, scenes, 
 Allowed node types: gel.dialogue (no speaker), gel.choice, gel.boolean, gel.if, gel.graph_output, gel.end_story.
 Links are [source, sourcePort, target, targetPort]. Use source entry for the scene entry. Dialogue text is narration. Do not emit Lua.`;
 
-export async function generateIr(directory: string, sceneId?: string, client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
+export async function generateIr(directory: string, sceneId?: string, client?: LlmClient): Promise<AuthorResult> {
   const dir = authoringDirectory(directory);
   try {
+    const llm = client ?? await clientForAgent("ir");
     const scenes = await readSceneFiles(dir);
     const scripts = await readScriptFiles(dir);
     const selected = sceneId === undefined ? scripts : scripts.filter((script) => script.id === sceneId);
@@ -163,7 +168,7 @@ export async function generateIr(directory: string, sceneId?: string, client: Ll
       const card = scenes.find((scene) => scene.id === script.id);
       return `# ${script.id}\n${card ? card.body : ""}\n\n${script.body}`;
     }).join("\n\n");
-    const payload = await completeWithRetry(client, IR_SYSTEM, user);
+    const payload = await completeWithRetry(llm, IR_SYSTEM, user);
     const { validateStoryIr } = await import("./ir");
     const diagnostics = validateStoryIr(payload);
     if (diagnostics.length > 0) return { ok: false, stage: "ir", directory: dir, diagnostics };
@@ -254,17 +259,11 @@ function requiredId(value: unknown): string {
   return value;
 }
 
-function unavailable(stage: string, directory: string): AuthorResult {
-  return {
-    ok: false,
-    stage,
-    directory: authoringDirectory(directory),
-    diagnostics: [{ code: "stage_unavailable", message: `Author stage '${stage}' is not implemented yet.` }],
-  };
-}
 
 function asDiagnostic(error: unknown): AuthorDiagnostic {
-  if (error instanceof LlmError || error instanceof MarkdownParseError) return { code: error.code, message: error.message };
+  if (error instanceof LlmError || error instanceof MarkdownParseError || error instanceof ConfigError) {
+    return { code: error.code, message: error.message };
+  }
   if (error instanceof Error) return { code: "authoring_error", message: error.message };
   return { code: "authoring_error", message: String(error) };
 }
