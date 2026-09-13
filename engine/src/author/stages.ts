@@ -6,7 +6,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { authoringDirectory, readAssetTexts, readSceneFiles, readScriptFiles, writeStatus, writeText } from "./workspace";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { consumeJsonLines, emptyIrFold, finishIrFold, pushIrEvent, StreamError } from "./stream";
+import { consumeJsonLines, emptyIrFold, finishIrFold, partialJsonString, partialJsonStringArray, pushIrEvent, StreamError } from "./stream";
 
 const SCENE_SYSTEM = `You plan Galgame scenes for GEL.
 Return JSON only: {"scenes":[{"id":"prologue","title":"序章","exits":["continue"],"body":"..."}]}.
@@ -317,7 +317,8 @@ async function generateScenesStream(directory: string, client: LlmClient, user: 
   const scenes: SceneMarkdown[] = [];
   const flushPreview = (): void => {
     const parts = scenes.map((scene) => serializeSceneMarkdown(scene));
-    if (pending.trim().length > 0) parts.push(pending.trim());
+    const draft = sceneMarkdownFromPartialJson(pending);
+    if (draft.length > 0) parts.push(draft);
     writeFileSync(join(directory, preview), parts.join("\n\n"));
   };
   await client.stream!(SCENE_STREAM_SYSTEM, user, (delta) => {
@@ -353,6 +354,20 @@ async function generateScriptStream(directory: string, client: LlmClient, scene:
   parseScriptMarkdown(await readFile(join(directory, relative), "utf8"), scene.id);
   return scene.id;
  }
+function sceneMarkdownFromPartialJson(pending: string): string {
+  const id = partialJsonString(pending, "id");
+  const title = partialJsonString(pending, "title");
+  const body = partialJsonString(pending, "body");
+  if (id === undefined && title === undefined && body === undefined) return "";
+  return serializeSceneMarkdown({
+    id: id && id.length > 0 ? id : "generating",
+    title: title && title.length > 0 ? title : id && id.length > 0 ? id : "generating",
+    exits: partialJsonStringArray(pending, "exits") ?? [],
+    body: body ?? "",
+  });
+}
+
+ 
 
 function sceneFromRecord(value: unknown): SceneMarkdown {
   if (value === null || typeof value !== "object") throw new MarkdownParseError("invalid_llm_json", "Scene entry must be an object");

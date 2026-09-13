@@ -135,12 +135,17 @@ describe("scene generation", () => {
     const dir = await mkdtemp(join(tmpdir(), "gel-author-scenes-stream-"));
     await initAuthoring(dir);
     const { generateScenes } = await import("../../src/author/stages");
+    const first = JSON.stringify({ id: "prologue", title: "序章", exits: ["continue"], body: "# Goal\nArrive." });
+    const second = `\n${JSON.stringify({ id: "ending", title: "结局", exits: [], body: "# Goal\nEnd." })}\n`;
     const result = await generateScenes(dir, {
       completeJson: async () => ({ scenes: [] }),
       stream: async (_system, _user, onDelta) => {
-        const text = `${JSON.stringify({ id: "prologue", title: "序章", exits: ["continue"], body: "# Goal\\nArrive." })}\n${JSON.stringify({ id: "ending", title: "结局", exits: [], body: "# Goal\\nEnd." })}\n`;
-        onDelta(text);
-        return text;
+        onDelta(first.slice(0, first.indexOf("Arrive")));
+        const preview = await readFile(join(dir, "review", "preview.md"), "utf8");
+        expect(preview).toContain("# Goal");
+        expect(preview).not.toContain('{"id"');
+        onDelta(first.slice(first.indexOf("Arrive")) + second);
+        return first + second;
       },
     });
     expect(result.ok).toBe(true);

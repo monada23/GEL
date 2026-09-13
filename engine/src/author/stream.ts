@@ -66,6 +66,77 @@ export function consumeJsonLines(buffer: string, onObject: (value: unknown) => v
   return rest;
 }
 
+
+const JSON_ESCAPES: Record<string, string> = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", '"': '"', "\\": "\\", "/": "/" };
+
+export function partialJsonString(text: string, key: string): string | undefined {
+  const start = jsonKeyValueStart(text, key);
+  if (start < 0) return undefined;
+  let i = skipWs(text, start);
+  if (i >= text.length) return "";
+  if (text[i] !== '"') return undefined;
+  return readPartialJsonString(text, i + 1).value;
+}
+
+export function partialJsonStringArray(text: string, key: string): string[] | undefined {
+  const start = jsonKeyValueStart(text, key);
+  if (start < 0) return undefined;
+  let i = skipWs(text, start);
+  if (i >= text.length) return [];
+  if (text[i] !== "[") return undefined;
+  i += 1;
+  const values: string[] = [];
+  while (i < text.length) {
+    i = skipWs(text, i);
+    if (i >= text.length) return values;
+    if (text[i] === "]") return values;
+    if (text[i] === ",") { i += 1; continue; }
+    if (text[i] !== '"') return values;
+    const read = readPartialJsonString(text, i + 1);
+    values.push(read.value);
+    if (!read.closed) return values;
+    i = read.end;
+  }
+  return values;
+}
+
+function jsonKeyValueStart(text: string, key: string): number {
+  const re = new RegExp(`"${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"\\s*:`);
+  const match = re.exec(text);
+  return match === null ? -1 : match.index + match[0].length;
+}
+
+function skipWs(text: string, index: number): number {
+  while (index < text.length && (text[index] === " " || text[index] === "\n" || text[index] === "\r" || text[index] === "\t")) index += 1;
+  return index;
+}
+
+function readPartialJsonString(text: string, index: number): { value: string; closed: boolean; end: number } {
+  let i = index;
+  let value = "";
+  while (i < text.length) {
+    const char = text[i];
+    if (char === '"') return { value, closed: true, end: i + 1 };
+    if (char === "\\") {
+      if (i + 1 >= text.length) return { value, closed: false, end: i };
+      const next = text[i + 1];
+      if (next === "u") {
+        const hex = text.slice(i + 2, i + 6);
+        if (hex.length < 4) return { value, closed: false, end: i };
+        value += String.fromCharCode(Number.parseInt(hex, 16));
+        i += 6;
+        continue;
+      }
+      value += JSON_ESCAPES[next] ?? next;
+      i += 2;
+      continue;
+    }
+    value += char;
+    i += 1;
+  }
+  return { value, closed: false, end: i };
+}
+
 export interface IrFoldState {
   events: IrEvent[];
   entryScene: string;
