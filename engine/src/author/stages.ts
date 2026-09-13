@@ -47,13 +47,14 @@ export async function generateScripts(directory: string, sceneId?: string, clien
     const outline = parseOutline(await readFile(join(dir, "outline.md"), "utf8"));
     const scenes = await readSceneFiles(dir);
     const assets = await readAssetTexts(dir);
+    const mergedFocus = [focus, await readFocus(dir)].filter((part) => part.trim().length > 0).join("\n\n");
     const targets = sceneId === undefined ? scenes : scenes.filter((scene) => scene.id === sceneId);
     if (targets.length === 0) {
       return { ok: false, stage: "scripts", directory: dir, diagnostics: [{ code: "missing_scene", message: sceneId === undefined ? "No scene markdown to script." : `Scene '${sceneId}' is missing.` }] };
     }
     await mapPool(targets, SCRIPT_CONCURRENCY, async (scene) => {
       try {
-        const context = packSceneContext(outline.title, outline.body, scene, scenes, assets, focus);
+        const context = packSceneContext(outline.title, outline.body, scene, scenes, assets, mergedFocus);
         const payload = await completeWithRetry(client, SCRIPT_SYSTEM, `${context}\n\n# Write script for scene ${scene.id}`);
         const script = parseScriptPayload(payload, scene);
         await writeText(dir, `scripts/${script.id}.md`, serializeScriptMarkdown({ ...script, context }));
@@ -222,6 +223,14 @@ function packSceneContext(title: string, outline: string, scene: SceneMarkdown, 
   const neighbors = scenes.filter((item) => item.id !== scene.id && (scene.exits.includes(item.id) || item.exits.includes(scene.id) || scene.body.includes(item.id) || item.body.includes(scene.id)));
   const neighborText = neighbors.length === 0 ? "(none)" : neighbors.map((item) => `${item.id}: ${item.title}`).join(", ");
   return [`# Story\n${title}`, `# Outline\n${outline}`, `# This scene\n${scene.id} (${scene.title})\nexits: ${scene.exits.join(", ") || "(none)"}\n${scene.body}`, `# Neighbors\n${neighborText}`, `# Other scenes\n${others || "(none)"}`, `# Assets\n${assets || "(none)"}`, focus ? `# Focus\n${focus}` : ""].filter((part) => part.length > 0).join("\n\n");
+}
+
+async function readFocus(directory: string): Promise<string> {
+  try {
+    return await readFile(join(directory, "review", "focus.txt"), "utf8");
+  } catch {
+    return "";
+  }
 }
 
 async function mapPool<T>(items: readonly T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {

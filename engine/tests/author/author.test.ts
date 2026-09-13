@@ -205,4 +205,21 @@ describe("scene generation", () => {
     expect(result.ok).toBe(true);
     expect(JSON.parse(await readFile(join(dir, "ir", "story.json"), "utf8")).entryScene).toBe("prologue");
   });
+
+  it("includes review/focus.txt when scripting a scene", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-focus-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "prologue.md"), "---\nid: prologue\ntitle: 序章\n---\n\n# Goal\nStart.\n", "utf8");
+    await writeFile(join(dir, "review", "focus.txt"), "Make the station colder.\n", "utf8");
+    const { generateScripts } = await import("../../src/author/stages");
+    let prompt = "";
+    const result = await generateScripts(dir, "prologue", {
+      completeJson: async (_system, user) => {
+        prompt = user;
+        return { id: "prologue", title: "序章", body: "# Script\nCold station." };
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(prompt).toContain("Make the station colder.");
+  });
 });
