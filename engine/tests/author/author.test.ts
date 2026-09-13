@@ -130,4 +130,27 @@ describe("scene generation", () => {
     expect(result.scenes).toEqual(["prologue"]);
     expect(await readFile(join(dir, "scenes", "prologue.md"), "utf8")).toContain("# Goal");
   });
+
+  it("scripts scenes in parallel and keeps successes when one fails", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-scripts-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "prologue.md"), "---\nid: prologue\ntitle: 序章\nexits: [ending]\n---\n\n# Goal\nStart.\n", "utf8");
+    await writeFile(join(dir, "scenes", "middle.md"), "---\nid: middle\ntitle: 中段\n---\n\n# Goal\nMiddle.\n", "utf8");
+    await writeFile(join(dir, "scenes", "ending.md"), "---\nid: ending\ntitle: 结局\n---\n\n# Goal\nEnd.\n", "utf8");
+    const { generateScripts } = await import("../../src/author/stages");
+    const seen: string[] = [];
+    const result = await generateScripts(dir, undefined, {
+      completeJson: async (_system, user) => {
+        seen.push(user);
+        if (user.includes("Write script for scene ending")) throw new Error("boom");
+        const id = user.includes("prologue") && user.includes("Write script for scene prologue") ? "prologue" : "middle";
+        return { id, title: id, body: `# Script\n${id} line.` };
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.scripts).toEqual(expect.arrayContaining(["prologue", "middle"]));
+    expect(result.scripts).not.toContain("ending");
+    expect(await readFile(join(dir, "scripts", "prologue.md"), "utf8")).toContain("prologue line");
+    expect(seen.some((user) => user.includes("Write script for scene prologue") && user.includes("ending: 结局"))).toBe(true);
+  });
 });

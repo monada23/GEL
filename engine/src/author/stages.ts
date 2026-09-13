@@ -1,7 +1,7 @@
 import { LlmError, defaultLlmClient, type LlmClient } from "./llm";
-import { MarkdownParseError, parseOutline, serializeSceneMarkdown } from "./markdown";
-import type { AuthorDiagnostic, AuthorResult, SceneMarkdown } from "./types";
-import { authoringDirectory, readAssetTexts, writeText } from "./workspace";
+import { MarkdownParseError, parseOutline, serializeSceneMarkdown, serializeScriptMarkdown } from "./markdown";
+import type { AuthorDiagnostic, AuthorResult, SceneMarkdown, ScriptMarkdown } from "./types";
+import { authoringDirectory, readAssetTexts, readSceneFiles, writeText } from "./workspace";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -31,8 +31,41 @@ export async function generateScenes(directory: string, client: LlmClient = defa
   }
 }
 
-export async function generateScripts(directory: string, _sceneId?: string, _client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
-  return unavailable("scripts", directory);
+const SCRIPT_SYSTEM = `You write one GEL scene script.
+Return JSON only: {"id":"prologue","title":"序章","body":"..."}.
+Write playable beats the later generator can turn into narration, choice, if, output, or end.
+Do not use named character speakers, stage directions as engine calls, or Lua.
+Keep the user-facing script in body; context is supplied separately.`;
+
+const SCRIPT_CONCURRENCY = 3;
+
+export async function generateScripts(directory: string, sceneId?: string, client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
+  const dir = authoringDirectory(directory);
+  const diagnostics: AuthorDiagnostic[] = [];
+  const written: string[] = [];
+  try {
+    const outline = parseOutline(await readFile(join(dir, "outline.md"), "utf8"));
+    const scenes = await readSceneFiles(dir);
+    const assets = await readAssetTexts(dir);
+    const targets = sceneId === undefined ? scenes : scenes.filter((scene) => scene.id === sceneId);
+    if (targets.length === 0) {
+      return { ok: false, stage: "scripts", directory: dir, diagnostics: [{ code: "missing_scene", message: sceneId === undefined ? "No scene markdown to script." : `Scene '${sceneId}' is missing.` }] };
+    }
+    await mapPool(targets, SCRIPT_CONCURRENCY, async (scene) => {
+      try {
+        const context = packSceneContext(outline.title, outline.body, scene, scenes, assets);
+        const payload = await completeWithRetry(client, SCRIPT_SYSTEM, `${context}\n\n# Write script for scene ${scene.id}`);
+        const script = parseScriptPayload(payload, scene);
+        await writeText(dir, `scripts/${script.id}.md`, serializeScriptMarkdown({ ...script, context }));
+        written.push(script.id);
+      } catch (error) {
+        diagnostics.push({ ...asDiagnostic(error), path: `scripts/${scene.id}.md` });
+      }
+    });
+    return { ok: diagnostics.length === 0, stage: "scripts", directory: dir, diagnostics, scripts: written, failed: diagnostics.map((item) => item.path) };
+  } catch (error) {
+    return { ok: false, stage: "scripts", directory: dir, diagnostics: [asDiagnostic(error)] };
+  }
 }
 
 export async function reviewScripts(directory: string, _client: LlmClient = defaultLlmClient()): Promise<AuthorResult> {
@@ -68,6 +101,38 @@ function parseScenePayload(payload: unknown): SceneMarkdown[] {
   }
   if (scenes.length === 0) throw new MarkdownParseError("invalid_llm_json", "LLM returned no scenes");
   return scenes;
+}
+
+function parseScriptPayload(payload: unknown, scene: SceneMarkdown): ScriptMarkdown {
+  if (payload === null || typeof payload !== "object") throw new MarkdownParseError("invalid_llm_json", "LLM script payload must be an object");
+  const record = payload as Record<string, unknown>;
+  const id = typeof record.id === "string" ? requiredId(record.id) : scene.id;
+  if (id !== scene.id) throw new MarkdownParseError("script_id_mismatch", `Script id '${id}' must match scene '${scene.id}'`);
+  const title = typeof record.title === "string" && record.title.length > 0 ? record.title : scene.title;
+  const body = typeof record.body === "string" ? record.body : "";
+  if (body.trim().length === 0) throw new MarkdownParseError("invalid_llm_json", "Script body is empty");
+  return { id, title, body, context: "" };
+}
+
+function packSceneContext(title: string, outline: string, scene: SceneMarkdown, scenes: readonly SceneMarkdown[], assets: string, focus = ""): string {
+  const others = scenes.filter((item) => item.id !== scene.id).map((item) => `## ${item.id} (${item.title})\nexits: ${item.exits.join(", ") || "(none)"}\n${item.body}`).join("\n\n");
+  const neighbors = scenes.filter((item) => item.id !== scene.id && (scene.exits.includes(item.id) || item.exits.includes(scene.id) || scene.body.includes(item.id) || item.body.includes(scene.id)));
+  const neighborText = neighbors.length === 0 ? "(none)" : neighbors.map((item) => `${item.id}: ${item.title}`).join(", ");
+  return [`# Story\n${title}`, `# Outline\n${outline}`, `# This scene\n${scene.id} (${scene.title})\nexits: ${scene.exits.join(", ") || "(none)"}\n${scene.body}`, `# Neighbors\n${neighborText}`, `# Other scenes\n${others || "(none)"}`, `# Assets\n${assets || "(none)"}`, focus ? `# Focus\n${focus}` : ""].filter((part) => part.length > 0).join("\n\n");
+}
+
+async function mapPool<T>(items: readonly T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const run = async (): Promise<void> => {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      await worker(items[index]);
+    }
+  };
+  const workers = Array.from({ length: Math.min(Math.max(limit, 1), items.length) }, () => run());
+  await Promise.all(workers);
 }
 
 function requiredId(value: unknown): string {
