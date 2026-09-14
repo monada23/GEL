@@ -296,7 +296,7 @@ async function generateIrStream(directory: string, client: LlmClient, prefix: st
     }
     pushIrEvent(state, value);
     accepted.push(value);
-    if (event.op === "story" || event.op === "route") writeEvent(event);
+    if (event.op === "story") writeEvent(event);
   }, () => state.done, () => accepted.map((item) => JSON.stringify(item)).join("\n"), "done-op", directory);
   state.done = false;
   let filled = 0;
@@ -313,6 +313,11 @@ async function generateIrStream(directory: string, client: LlmClient, prefix: st
     });
     await flush;
   });
+  for (const [from, mapping] of Object.entries(state.routes)) {
+    for (const [exit, to] of Object.entries(mapping)) {
+      writeEvent({ op: "route", from, exit, to });
+    }
+  }
   pushIrEvent(state, { op: "done" });
   writeEvent({ op: "done" });
   return finishIrFold(state);

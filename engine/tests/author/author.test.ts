@@ -316,7 +316,7 @@ describe("scene generation", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("writes graph routes into stream.jsonl during the graph step", async () => {
+  it("writes graph routes into stream.jsonl after interiors", async () => {
     const dir = await mkdtemp(join(tmpdir(), "gel-author-ir-routes-"));
     await initAuthoring(dir);
     await writeFile(join(dir, "scenes", "alpha.md"), "---\nid: alpha\ntitle: 甲\nexits: [to-beta]\n---\n\n# Goal\nA.\n", "utf8");
@@ -357,12 +357,14 @@ describe("scene generation", () => {
     const jsonl = join(dir, "ir", "stream.jsonl");
     let streamed = "";
     const deadline = Date.now() + 5000;
-    while (Date.now() < deadline && !streamed.includes('"op":"route"')) {
+    while (Date.now() < deadline && !streamed.includes('"op":"story"')) {
       streamed = await readFile(jsonl, "utf8").catch(() => "");
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+    expect(streamed).not.toContain('"op":"route"');
     releaseScenes();
     const result = await run;
+    streamed = await readFile(jsonl, "utf8");
     expect(streamed).toContain('"op":"route"');
     expect(result.ok).toBe(true);
   });
