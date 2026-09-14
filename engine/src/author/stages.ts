@@ -3,7 +3,7 @@ import { LlmError, clientForAgent, parseJsonPayload, type LlmClient } from "./ll
 import { MarkdownParseError, parseOutline, parseScriptMarkdown, serializeSceneMarkdown, serializeScriptMarkdown } from "./markdown";
 import type { AuthorDiagnostic, AuthorResult, SceneMarkdown, ScriptMarkdown } from "./types";
 import { appendFileSync, writeFileSync } from "node:fs";
-import { authoringDirectory, readAssetTexts, readSceneFiles, readScriptFiles, writeStatus, writeText } from "./workspace";
+import { authoringDirectory, pulseActivity, readAssetTexts, readSceneFiles, readScriptFiles, writeStatus, writeText } from "./workspace";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { consumeJsonLines, emptyIrFold, finishIrFold, parseIrEvent, partialJsonString, partialJsonStringArray, pushIrEvent, StreamError } from "./stream";
@@ -34,7 +34,7 @@ export async function generateScenes(directory: string, client?: LlmClient): Pro
     const assets = await readAssetTexts(dir);
     const user = `${outline.body}\n\n# Assets\n${assets || "(none)"}`;
     const scenes = llm.stream === undefined
-      ? parseScenePayload(await completeWithRetry(llm, SCENE_SYSTEM, user, previewDelta(dir, "scenes", "review/preview.md")))
+      ? parseScenePayload(await completeWithRetry(llm, SCENE_SYSTEM, user, previewDelta(dir, "scenes", "review/preview.md"), () => pulseActivity(dir)))
       : await generateScenesStream(dir, llm, user);
     if (llm.stream === undefined) {
       for (const scene of scenes) {
@@ -79,7 +79,7 @@ export async function generateScripts(directory: string, sceneId?: string, clien
       try {
         const task = scriptTask(scene.id, mergedFocus);
         if (llm.stream === undefined) {
-          const payload = await completeWithRetry(llm, `${SCRIPT_SYSTEM}\n\n${prefix}`, task, previewDelta(dir, "scripts", "review/preview.md"));
+          const payload = await completeWithRetry(llm, `${SCRIPT_SYSTEM}\n\n${prefix}`, task, previewDelta(dir, "scripts", "review/preview.md"), () => pulseActivity(dir));
           const script = parseScriptPayload(payload, scene);
           await writeText(dir, `scripts/${script.id}.md`, serializeScriptMarkdown({ ...script, context: prefix }));
           written.push(script.id);
@@ -143,7 +143,7 @@ async function collectFindings(directory: string, client: LlmClient): Promise<Re
   const scripts = await readScriptFiles(directory);
   if (scripts.length === 0) throw new MarkdownParseError("missing_scene", "No scripts to review.");
   const user = [`# Outline\n${outline.body}`, `# Scenes\n${scenes.map((scene) => `## ${scene.id}\n${scene.body}`).join("\n\n")}`, `# Scripts\n${scripts.map((script) => `## ${script.id}\n${script.body}`).join("\n\n")}`].join("\n\n");
-  const payload = await completeWithRetry(client, REVIEW_SYSTEM, user);
+  const payload = await completeWithRetry(client, REVIEW_SYSTEM, user, undefined, () => pulseActivity(directory));
   return parseFindings(payload);
 }
 
@@ -174,202 +174,54 @@ function groupFindings(findings: readonly ReviewFinding[]): Map<string, ReviewFi
 }
 
 const IR_GRAPH_SYSTEM = `You lay out a GEL story graph.
-Emit one JSON object per line. No markdown fences. No extra keys.
-Allowed ops only: story, route, done. Do not emit scene, node, or link.
-Scene cards already exist; you only choose entryScene and connect listed exits.
-
-## story
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op","entryScene"],
-  "properties":{
-    "op":{"const":"story"},
-    "entryScene":{"type":"string","pattern":"^[a-z][a-z0-9_.-]*$"}
-  }
-}
+Emit one JSON object per line, no markdown fences, in this exact order:
+1. {"op":"story","entryScene":"<id>"} — id must be one of the given scenes
+2. {"op":"route","from":"<scene>","exit":"<exit>","to":"<scene>"} — one per listed exit
+3. {"op":"done"}
 Rules:
-- Emit exactly once, as the first event.
-- entryScene must be one of the given scene ids.
-
-## route
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op","from","exit","to"],
-  "properties":{
-    "op":{"const":"route"},
-    "from":{"type":"string","pattern":"^[a-z][a-z0-9_.-]*$"},
-    "exit":{"type":"string","pattern":"^[a-z][a-z0-9_.-]*$"},
-    "to":{"type":"string","pattern":"^[a-z][a-z0-9_.-]*$"}
-  }
-}
-Rules:
-- Emit only after story.
-- from and to must be given scene ids. Never invent a scene. to must never be end_story.
-- exit must be an exit listed on the from scene card.
-- Each listed exit has exactly one route. A scene with exits (none) gets no routes.
-
-## done
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op"],
-  "properties":{"op":{"const":"done"}}
-}
-Rules:
-- Emit once, last. After every listed exit has a route.`;
+- Do not emit scene, node, or link. Scene cards already exist.
+- Do not invent scene ids or extra exits.
+- route.to must be an existing scene id, never end_story.
+- A scene with no exits ends in gel.end_story later; emit no route for it.
+- Every listed exit must have exactly one route.
+- entryScene is the first playable scene.`;
 
 const IR_SCENE_SYSTEM = `You fill one GEL scene inner graph from its script.
-Emit one JSON object per line. No markdown fences. No extra keys.
-Allowed ops only: node and link. Do not emit story, scene, route, or done.
+Emit one JSON object per line, no markdown fences.
 Order: every node, then every link. Never link to an id you have not emitted.
-No speakers. No Lua.
+Do not emit story, scene, route, or done. No speakers, no Lua.
 
-Shared node fields: op=node, id matches ^[a-z][a-z0-9_-]*$ and is not entry.
+Ports (wrong names fail validation):
+- entry flow out: ["entry","out"]
+- gel.dialogue flow out: ["d1","next"]  (never "out")
+- gel.choice flow out: ["c1","<choice.id>"]
+- gel.if flow out: ["if1","true"] and ["if1","false"]
+- gel.if condition: ["b1","value"] -> ["if1","condition"] from a gel.boolean
+- every flow target port is "in"
 
-## gel.dialogue
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op","id","type","text"],
-  "properties":{
-    "op":{"const":"node"},
-    "id":{"type":"string","pattern":"^[a-z][a-z0-9_-]*$"},
-    "type":{"const":"gel.dialogue"},
-    "text":{"type":"string","minLength":1}
-  }
-}
-Rules:
-- Do not emit speaker.
-- Flow out port is next, never out.
+Node shapes:
+{"op":"node","id":"d1","type":"gel.dialogue","text":"..."}
+{"op":"node","id":"c1","type":"gel.choice","choices":[{"id":"enter","label":"进去看看"},{"id":"leave","label":"直接回家"}]}
+{"op":"node","id":"b1","type":"gel.boolean","value":true}
+{"op":"node","id":"if1","type":"gel.if"}
+{"op":"node","id":"out","type":"gel.graph_output","interfaceId":"<exit>"}
+{"op":"node","id":"end","type":"gel.end_story"}
 
-## gel.choice
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op","id","type","choices"],
-  "properties":{
-    "op":{"const":"node"},
-    "id":{"type":"string","pattern":"^[a-z][a-z0-9_-]*$"},
-    "type":{"const":"gel.choice"},
-    "choices":{
-      "type":"array",
-      "minItems":1,
-      "items":{
-        "type":"object",
-        "additionalProperties":false,
-        "required":["id","label"],
-        "properties":{
-          "id":{"type":"string","pattern":"^[a-z][a-z0-9_-]*$"},
-          "label":{"type":"string","minLength":1}
-        }
-      }
-    }
-  }
-}
-Rules:
-- Choice ids start with a letter, not a digit. Do not use text/port.
-- One outgoing link per choice; from port is that choice id.
+Links:
+{"op":"link","from":["entry","out"],"to":["d1","in"]}
+{"op":"link","from":["d1","next"],"to":["c1","in"]}
 
-## gel.boolean
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op","id","type","value"],
-  "properties":{
-    "op":{"const":"node"},
-    "id":{"type":"string","pattern":"^[a-z][a-z0-9_-]*$"},
-    "type":{"const":"gel.boolean"},
-    "value":{"type":"boolean"}
-  }
-}
-Rules:
-- Only used to feed gel.if. Out port is value.
-
-## gel.if
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op","id","type"],
-  "properties":{
-    "op":{"const":"node"},
-    "id":{"type":"string","pattern":"^[a-z][a-z0-9_-]*$"},
-    "type":{"const":"gel.if"}
-  }
-}
-Rules:
-- Do not put a condition string on the node.
-- Requires one data link: [booleanId,value] -> [ifId,condition].
-- Requires flow outs true and false.
-
-## gel.graph_output
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op","id","type","interfaceId"],
-  "properties":{
-    "op":{"const":"node"},
-    "id":{"type":"string","pattern":"^[a-z][a-z0-9_-]*$"},
-    "type":{"const":"gel.graph_output"},
-    "interfaceId":{"type":"string","pattern":"^[a-z][a-z0-9_.-]*$"}
-  }
-}
-Rules:
-- Only for required exits listed in the user message.
-- interfaceId equals that exit name. One output per exit.
-- If required exits are (none), do not emit graph_output.
-
-## gel.end_story
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op","id","type"],
-  "properties":{
-    "op":{"const":"node"},
-    "id":{"type":"string","pattern":"^[a-z][a-z0-9_-]*$"},
-    "type":{"const":"gel.end_story"}
-  }
-}
-Rules:
-- Use when this scene ends the story. No graph_output and no route.
-
-## link
-Schema:
-{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["op","from","to"],
-  "properties":{
-    "op":{"const":"link"},
-    "from":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"string"}},
-    "to":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"string"}}
-  }
-}
-Rules:
-- Both ids must already have been emitted as nodes (entry is predefined).
-- First link must be from [entry,out] to [firstNode,in].
-- from ports: entry=out; dialogue=next; choice=<choice.id>; if=true|false; boolean=value (only to if.condition).
-- to ports: in for flow; condition only for gel.if.
-- Never use out on gel.dialogue.`;
+If this scene continues to another scene, each required exit is a gel.graph_output whose interfaceId equals that exit.
+If this scene ends the story, use gel.end_story and no graph_output.
+Local ids match ^[a-z][a-z0-9_-]*$. Choice ids must start with a letter, not a digit.`;
 
 const IR_GRAPH_JSON_SYSTEM = `You lay out a GEL story graph.
-Return JSON only, additionalProperties false: {"entryScene":"prologue","routes":{"prologue":{"enter":"library"}}}.
-entryScene and every routes.from / routes.*.to are given scene ids. Each listed exit has exactly one route. to is never end_story. No nodes.`;
+Return JSON only: {"entryScene":"prologue","routes":{"prologue":{"enter":"library"}}}.
+Use only given scene ids. Every listed exit needs a route. route.to is a scene id, never end_story. No nodes.`;
 
 const IR_SCENE_JSON_SYSTEM = `You fill one GEL scene from its script.
-Return JSON only: {"nodes":[...],"links":[["fromId","fromPort","toId","toPort"],...]}.
-Node objects follow the same per-type fields as gel.dialogue (text), gel.choice (choices[{id,label}]), gel.boolean (value), gel.if (id only), gel.graph_output (interfaceId), gel.end_story (id only).
-Links: first is [entry,out,<id>,in]; dialogue fromPort is next not out; choice fromPort is choice id; if needs [booleanId,value,ifId,condition] plus true/false. Story end uses gel.end_story, not graph_output.`;
+Return JSON only: {"nodes":[{"id":"d1","type":"gel.dialogue","text":"..."},{"id":"end","type":"gel.end_story"}],"links":[["entry","out","d1","in"],["d1","next","end","in"]]}.
+Dialogue flow port is next, not out. Choice options are {id,label} with letter-starting ids. If needs a gel.boolean linked to condition. Story end is gel.end_story, not graph_output.`;
 
 const IR_SCENE_CONCURRENCY = 3;
 
@@ -426,7 +278,7 @@ async function generateIrStream(directory: string, client: LlmClient, prefix: st
   const relative = "ir/stream.jsonl";
   const jsonl = join(directory, relative);
   await writeText(directory, relative, "");
-  await writeStatus(directory, { state: "running", stage: "ir", ok: true, message: "Laying out scenes", diagnostics: [] });
+  await writeStatus(directory, { state: "running", stage: "ir", ok: true, message: "Laying out scenes", diagnostics: [], previewFile: relative });
   const state = emptyIrFold();
   const writeEvent = (value: unknown): void => {
     appendFileSync(jsonl, `${JSON.stringify(value)}\n`);
@@ -444,24 +296,23 @@ async function generateIrStream(directory: string, client: LlmClient, prefix: st
     }
     pushIrEvent(state, value);
     accepted.push(value);
-    if (event.op === "story") writeEvent(event);
+    if (event.op === "story" || event.op === "route") writeEvent(event);
   }, () => state.done, () => accepted.map((item) => JSON.stringify(item)).join("\n"), "done-op", directory);
   state.done = false;
-  const interiors = new Map<string, unknown[]>();
+  let filled = 0;
+  let flush = Promise.resolve();
   await mapPool(selected, IR_SCENE_CONCURRENCY, async (script) => {
-    interiors.set(script.id, await generateSceneInteriorStream(client, prefix, script, scenes, directory));
+    const events = await generateSceneInteriorStream(client, prefix, script, scenes, directory);
+    flush = flush.then(() => {
+      for (const event of events) {
+        pushIrEvent(state, event);
+        writeEvent(event);
+      }
+      filled += 1;
+      void writeStatus(directory, { state: "running", stage: "ir", ok: true, message: `Filled scene ${script.id} (${filled}/${selected.length})`, diagnostics: [], previewFile: relative });
+    });
+    await flush;
   });
-  for (const script of selected) {
-    for (const event of interiors.get(script.id) ?? []) {
-      pushIrEvent(state, event);
-      writeEvent(event);
-    }
-  }
-  for (const [from, mapping] of Object.entries(state.routes)) {
-    for (const [exit, to] of Object.entries(mapping)) {
-      writeEvent({ op: "route", from, exit, to });
-    }
-  }
   pushIrEvent(state, { op: "done" });
   writeEvent({ op: "done" });
   return finishIrFold(state);
@@ -517,6 +368,7 @@ async function runJsonlStream(
     let pending = "";
     let halt: Error | undefined;
     await client.stream!(system, user, (delta) => {
+      pulseActivity(directory);
       if (halt !== undefined) return;
       pending += delta;
       try {
@@ -533,7 +385,7 @@ async function runJsonlStream(
         halt = error instanceof Error ? error : new Error(String(error));
         pending = "";
       }
-    }, extra);
+    }, extra, () => pulseActivity(directory));
     if (halt === undefined && pending.trim().length > 0) {
       try {
         onObject(JSON.parse(pending.trim()));
@@ -570,7 +422,7 @@ function irGraphUser(prefix: string, selected: readonly ScriptMarkdown[], scenes
 function irSceneUser(prefix: string, script: ScriptMarkdown, scenes: readonly SceneMarkdown[]): string {
   const card = scenes.find((scene) => scene.id === script.id);
   const exits = card?.exits.join(", ") || "(none)";
-  return `${prefix}\n\n# Fill scene ${script.id}\nRequired graph_output interfaceIds: ${exits}\n(If (none), end with gel.end_story and emit no graph_output.)\n\n# Script\n${script.body}\n\nEmit nodes first, then links. Dialogue uses next (not out). First link must leave entry.`;
+  return `${prefix}\n\n# Fill scene ${script.id}\nRequired graph_output interfaceIds: ${exits}\n\n# Script\n${script.body}\n\nEmit nodes first, then links. Dialogue uses next (not out). First link must leave entry.`;
 }
 
 function parseGraphPayload(payload: unknown): { entryScene: string; routes: Record<string, Record<string, string>> } {
@@ -648,10 +500,10 @@ function parseSceneInterior(payload: unknown): { nodes: unknown[]; links: unknow
   });
   return { nodes, links };
 }
-export async function completeWithRetry(client: LlmClient, system: string, user: string, onDelta?: (text: string) => void): Promise<unknown> {
+export async function completeWithRetry(client: LlmClient, system: string, user: string, onDelta?: (text: string) => void, onActivity?: (text: string) => void): Promise<unknown> {
   const once = async (): Promise<unknown> => {
     if (client.stream !== undefined) {
-      return parseJsonPayload(await client.stream(system, user, onDelta ?? (() => undefined)));
+      return parseJsonPayload(await client.stream(system, user, onDelta ?? (() => undefined), [], onActivity));
     }
     return client.completeJson(system, user);
   };
@@ -707,7 +559,7 @@ async function generateScenesStream(directory: string, client: LlmClient, user: 
       scenes.push(scene);
     });
     flushDraft();
-  });
+  }, [], () => pulseActivity(directory));
   if (pending.trim().length > 0) {
     const scene = sceneFromRecord(JSON.parse(pending.trim()));
     show(`scenes/${scene.id}.md`, serializeSceneMarkdown(scene));
@@ -728,7 +580,7 @@ async function generateScriptStream(directory: string, client: LlmClient, scene:
   await client.stream!(`${SCRIPT_STREAM_SYSTEM}\n\n${prefix}`, task, (delta) => {
     body += delta;
     write();
-  });
+  }, [], () => pulseActivity(directory));
   parseScriptMarkdown(await readFile(join(directory, relative), "utf8"), scene.id);
   return scene.id;
  }
