@@ -181,6 +181,7 @@ Emit one JSON object per line, no markdown fences, in this exact order:
 Rules:
 - Do not emit scene, node, or link. Scene cards already exist.
 - Do not invent scene ids or extra exits.
+- Never name an exit enter; that id is the reserved scene entry.
 - route.to must be an existing scene id, never end_story.
 - A scene with no exits ends in gel.end_story later; emit no route for it.
 - Every listed exit must have exactly one route.
@@ -201,7 +202,7 @@ Ports (wrong names fail validation):
 
 Node shapes:
 {"op":"node","id":"d1","type":"gel.dialogue","text":"..."}
-{"op":"node","id":"c1","type":"gel.choice","choices":[{"id":"enter","label":"进去看看"},{"id":"leave","label":"直接回家"}]}
+{"op":"node","id":"c1","type":"gel.choice","choices":[{"id":"go","label":"进去看看"},{"id":"leave","label":"直接回家"}]}
 {"op":"node","id":"b1","type":"gel.boolean","value":true}
 {"op":"node","id":"if1","type":"gel.if"}
 {"op":"node","id":"out","type":"gel.graph_output","interfaceId":"<exit>"}
@@ -211,13 +212,13 @@ Links:
 {"op":"link","from":["entry","out"],"to":["d1","in"]}
 {"op":"link","from":["d1","next"],"to":["c1","in"]}
 
-If this scene continues to another scene, each required exit is a gel.graph_output whose interfaceId equals that exit.
+If this scene continues to another scene, each required exit is a gel.graph_output whose interfaceId equals that exit. Never use enter as interfaceId.
 If this scene ends the story, use gel.end_story and no graph_output.
 Local ids match ^[a-z][a-z0-9_-]*$. Choice ids must start with a letter, not a digit.`;
 
 const IR_GRAPH_JSON_SYSTEM = `You lay out a GEL story graph.
-Return JSON only: {"entryScene":"prologue","routes":{"prologue":{"enter":"library"}}}.
-Use only given scene ids. Every listed exit needs a route. route.to is a scene id, never end_story. No nodes.`;
+Return JSON only: {"entryScene":"prologue","routes":{"prologue":{"continue":"library"}}}.
+Use only given scene ids. Every listed exit needs a route. Never name an exit enter (reserved for scene entry). route.to is a scene id, never end_story. No nodes.`;
 
 const IR_SCENE_JSON_SYSTEM = `You fill one GEL scene from its script.
 Return JSON only: {"nodes":[{"id":"d1","type":"gel.dialogue","text":"..."},{"id":"end","type":"gel.end_story"}],"links":[["entry","out","d1","in"],["d1","next","end","in"]]}.
@@ -294,8 +295,9 @@ async function generateIrStream(directory: string, client: LlmClient, prefix: st
     if (event.op === "node" || event.op === "link" || event.op === "scene") {
       throw new StreamError(`graph step cannot emit ${event.op}`);
     }
-    pushIrEvent(state, value);
-    accepted.push(value);
+    const next = event.op === "route" ? { ...event, exit: canonicalExit(event.exit) } : value;
+    pushIrEvent(state, next);
+    accepted.push(next);
     if (event.op === "story") writeEvent(event);
   }, () => state.done, () => accepted.map((item) => JSON.stringify(item)).join("\n"), "done-op", directory);
   state.done = false;
@@ -430,6 +432,11 @@ function irSceneUser(prefix: string, script: ScriptMarkdown, scenes: readonly Sc
   return `${prefix}\n\n# Fill scene ${script.id}\nRequired graph_output interfaceIds: ${exits}\n\n# Script\n${script.body}\n\nEmit nodes first, then links. Dialogue uses next (not out). First link must leave entry.`;
 }
 
+
+
+function canonicalExit(id: string): string {
+  return id === "enter" ? "continue" : id;
+}
 function parseGraphPayload(payload: unknown): { entryScene: string; routes: Record<string, Record<string, string>> } {
   if (payload === null || typeof payload !== "object") throw new StreamError("graph payload must be an object");
   const record = payload as Record<string, unknown>;
@@ -442,7 +449,7 @@ function parseGraphPayload(payload: unknown): { entryScene: string; routes: Reco
     routes[from] = {};
     for (const [exit, to] of Object.entries(mapping as Record<string, unknown>)) {
       if (typeof to !== "string") throw new StreamError(`routes.${from}.${exit} must be a scene id`);
-      routes[from][exit] = to;
+      routes[from][canonicalExit(exit)] = to;
     }
   }
   return { entryScene: record.entryScene, routes };
@@ -451,6 +458,9 @@ function parseGraphPayload(payload: unknown): { entryScene: string; routes: Reco
 function normalizeSceneEvent(raw: unknown, kinds: Map<string, string>, choiceIds: Map<string, string[]>): unknown {
   if (raw === null || typeof raw !== "object" || !("op" in raw)) return raw;
   const event = raw as Record<string, unknown>;
+  if (event.op === "node" && event.type === "gel.graph_output" && event.interfaceId === "enter") {
+    return { ...event, interfaceId: "continue" };
+  }
   if (event.op === "node" && event.type === "gel.choice") {
     return { ...event, choices: normalizeChoices(event.choices) };
   }

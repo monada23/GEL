@@ -139,6 +139,9 @@ function validateNode(value: unknown, path: string): AuthorDiagnostic[] {
     case "gel.if":
       return [];
     case "gel.graph_output":
+      if (value.interfaceId === "enter") {
+        return [diag("invalid_output", "graph_output interfaceId cannot be enter", path)];
+      }
       return typeof value.interfaceId === "string" && SCENE_ID_RE.test(value.interfaceId)
         ? []
         : [diag("invalid_output", "graph_output requires interfaceId", path)];

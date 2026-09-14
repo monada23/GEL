@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { appendFileSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { validateSceneIrFile, validateStoryIr } from "./ir";
 import { MarkdownParseError, parseOutline, parseSceneMarkdown, parseScriptMarkdown } from "./markdown";
@@ -100,7 +101,10 @@ export async function writeText(directory: string, relative: string, contents: s
 
 export async function writeStatus(directory: string, status: AuthorStatus): Promise<void> {
   await mkdir(directory, { recursive: true });
-  await writeFile(join(directory, "status.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  const path = join(directory, "status.json");
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  await rename(tmp, path);
 }
 
 export async function readStatus(directory: string): Promise<AuthorStatus> {

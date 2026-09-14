@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { authorMain } from "../../src/author/cli";
 import { validateSceneIrFile, validateStoryIr } from "../../src/author/ir";
 import { parseOutline, parseSceneMarkdown, parseScriptMarkdown, rewriteContext, splitContext } from "../../src/author/markdown";
-import { initAuthoring, validateAuthoring } from "../../src/author/workspace";
+import { initAuthoring, validateAuthoring, writeStatus } from "../../src/author/workspace";
 
 const validScene = {
   sceneId: "prologue",
@@ -108,6 +108,18 @@ describe("authoring workspace", () => {
     const validated = await validateAuthoring(dir);
     expect(validated.ok).toBe(false);
     expect(validated.diagnostics[0].code).toBe("missing_frontmatter");
+  });
+
+  it("replaces status.json without exposing torn JSON", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-status-"));
+    await writeStatus(dir, { state: "done", stage: "scenes", ok: true, message: "", diagnostics: [] });
+    const writers = Array.from({ length: 30 }, (_, i) =>
+      writeStatus(dir, { state: "running", stage: "scripts", ok: true, message: `n${i}`, diagnostics: [] }),
+    );
+    const readers = Array.from({ length: 30 }, async () => {
+      JSON.parse(await readFile(join(dir, "status.json"), "utf8"));
+    });
+    await Promise.all([...writers, ...readers]);
   });
 });
 
@@ -254,6 +266,42 @@ describe("scene generation", () => {
     const story = JSON.parse(await readFile(join(dir, "ir", "story.json"), "utf8")) as { entryScene: string; scenes: { links: unknown[] }[] };
     expect(story.entryScene).toBe("prologue");
     expect(story.scenes[0].links).toContainEqual(["d1", "next", "end", "in"]);
+  });
+
+  it("rewrites reserved enter exits to continue", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-ir-enter-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "prologue.md"), "---\nid: prologue\ntitle: 序章\nexits: [enter]\n---\n\n# Goal\nStart.\n", "utf8");
+    await writeFile(join(dir, "scenes", "ending.md"), "---\nid: ending\ntitle: 结局\n---\n\n# Goal\nEnd.\n", "utf8");
+    await writeFile(join(dir, "scripts", "prologue.md"), "---\nid: prologue\ntitle: 序章\n---\n\n# Script\nGo.\n", "utf8");
+    await writeFile(join(dir, "scripts", "ending.md"), "---\nid: ending\ntitle: 结局\n---\n\n# Script\nBye.\n", "utf8");
+    const { generateIr } = await import("../../src/author/stages");
+    const result = await generateIr(dir, undefined, {
+      completeJson: async (system, user) => {
+        if (system.includes("story graph")) return { entryScene: "prologue", routes: { prologue: { enter: "ending" } } };
+        if (user.includes("# Fill scene ending")) {
+          return {
+            nodes: [{ id: "end", type: "gel.end_story" }],
+            links: [["entry", "out", "end", "in"]],
+          };
+        }
+        return {
+          nodes: [
+            { id: "d1", type: "gel.dialogue", text: "Go on." },
+            { id: "out", type: "gel.graph_output", interfaceId: "enter" },
+          ],
+          links: [["entry", "out", "d1", "in"], ["d1", "next", "out", "in"]],
+        };
+      },
+    });
+    expect(result.ok).toBe(true);
+    const story = JSON.parse(await readFile(join(dir, "ir", "story.json"), "utf8")) as {
+      routes: Record<string, Record<string, string>>;
+      scenes: { sceneId: string; nodes: { type: string; interfaceId?: string }[] }[];
+    };
+    expect(story.routes.prologue).toEqual({ continue: "ending" });
+    const outputs = story.scenes.find((scene) => scene.sceneId === "prologue")?.nodes.filter((node) => node.type === "gel.graph_output") ?? [];
+    expect(outputs).toEqual([{ id: "out", type: "gel.graph_output", interfaceId: "continue" }]);
   });
 
   it("includes review/focus.txt when scripting a scene", async () => {
