@@ -28,6 +28,7 @@ export type IrEvent =
 export async function readSseContent(
   body: ReadableStream<Uint8Array>,
   onDelta: (text: string) => void,
+  onActivity?: (text: string) => void,
 ): Promise<string> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -41,16 +42,23 @@ export async function readSseContent(
     pending = parts.pop() ?? "";
     for (const line of parts) {
       const delta = sseDelta(line);
-      if (delta.length > 0) {
-        full += delta;
-        onDelta(delta);
+      if (delta.text.length === 0) continue;
+      if (delta.reasoning) {
+        onActivity?.(delta.text);
+      } else {
+        full += delta.text;
+        onDelta(delta.text);
       }
     }
   }
   const tail = sseDelta(pending);
-  if (tail.length > 0) {
-    full += tail;
-    onDelta(tail);
+  if (tail.text.length > 0) {
+    if (tail.reasoning) {
+      onActivity?.(tail.text);
+    } else {
+      full += tail.text;
+      onDelta(tail.text);
+    }
   }
   return full;
 }
@@ -263,19 +271,53 @@ function isPair(value: unknown): value is [string, string] {
   return Array.isArray(value) && value.length === 2 && typeof value[0] === "string" && typeof value[1] === "string";
 }
 
-function sseDelta(line: string): string {
+function sseDelta(line: string): { text: string; reasoning: boolean } {
+  const none = { text: "", reasoning: false };
   const trimmed = line.trim();
-  if (!trimmed.startsWith("data:")) return "";
+  if (!trimmed.startsWith("data:")) return none;
   const data = trimmed.slice(5).trim();
-  if (data.length === 0 || data === "[DONE]") return "";
+  if (data.length === 0 || data === "[DONE]") return none;
   const parsed: unknown = JSON.parse(data);
-  if (parsed === null || typeof parsed !== "object") return "";
-  const record = parsed as { type?: unknown; delta?: unknown };
+  if (parsed === null || typeof parsed !== "object") return none;
+  const record = parsed as Record<string, unknown>;
   if (record.type === "error" || record.type === "response.failed") {
-    throw new Error(typeof (parsed as { error?: { message?: unknown } }).error?.message === "string"
-      ? String((parsed as { error: { message: string } }).error.message)
+    throw new Error(typeof (record.error as { message?: unknown } | undefined)?.message === "string"
+      ? String((record.error as { message: string }).message)
       : "LLM response failed");
   }
-  if (record.type === "response.output_text.delta" && typeof record.delta === "string") return record.delta;
-  return "";
- }
+  const type = typeof record.type === "string" ? record.type : "";
+  const text = sseText(record);
+  if (text.length === 0) return none;
+  if (type === "response.output_text.delta") return { text, reasoning: false };
+  if (type.includes("reasoning") || type.includes("thinking") || sseReasoningField(record)) return { text, reasoning: true };
+  if (type.length > 0) return none;
+  return { text, reasoning: false };
+}
+
+function sseReasoningField(record: Record<string, unknown>): boolean {
+  if (record.delta !== null && typeof record.delta === "object" && typeof (record.delta as { reasoning_content?: unknown }).reasoning_content === "string") return true;
+  if (!Array.isArray(record.choices) || record.choices.length === 0) return false;
+  const delta = (record.choices[0] as { delta?: unknown } | undefined)?.delta;
+  return delta !== null && typeof delta === "object" && typeof (delta as { reasoning_content?: unknown }).reasoning_content === "string";
+}
+
+function sseText(record: Record<string, unknown>): string {
+  const direct = asText(record.delta) || asText(record.text);
+  if (direct.length > 0) return direct;
+  if (record.delta !== null && typeof record.delta === "object") {
+    const delta = record.delta as Record<string, unknown>;
+    const nested = asText(delta.text) || asText(delta.content) || asText(delta.reasoning_content);
+    if (nested.length > 0) return nested;
+  }
+  if (!Array.isArray(record.choices) || record.choices.length === 0) return "";
+  const choice = record.choices[0];
+  if (choice === null || typeof choice !== "object") return "";
+  const delta = (choice as { delta?: unknown }).delta;
+  if (delta === null || typeof delta !== "object") return asText(delta);
+  const chunk = delta as Record<string, unknown>;
+  return asText(chunk.reasoning_content) || asText(chunk.content) || asText(chunk.text);
+}
+
+function asText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}

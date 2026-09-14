@@ -43,6 +43,42 @@ describe("SSE and IR events", () => {
     expect(story.entryScene).toBe("prologue");
   });
 
+  it("routes reasoning deltas to onActivity while content stays clean", async () => {
+    const reasoningChunk = (text: string): string => `data: ${JSON.stringify({ type: "response.reasoning_summary_text.delta", delta: text })}\n`;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(reasoningChunk("thinking about scenes")));
+        controller.enqueue(new TextEncoder().encode(sseChunk("{")));
+        controller.enqueue(new TextEncoder().encode(reasoningChunk("more thought")));
+        controller.enqueue(new TextEncoder().encode(sseChunk("}")));
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n"));
+        controller.close();
+      },
+    });
+    const content: string[] = [];
+    const activity: string[] = [];
+    const text = await readSseContent(stream, (delta) => content.push(delta), (delta) => activity.push(delta));
+    expect(text).toBe("{}");
+    expect(content.join("")).toBe("{}");
+    expect(activity).toEqual(["thinking about scenes", "more thought"]);
+  });
+
+
+  it("treats object-shaped reasoning deltas as activity", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "response.reasoning_summary_text.delta", delta: { text: "ponder" } })}\n`));
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ delta: { reasoning_content: "chain" } }] })}\n`));
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n"));
+        controller.close();
+      },
+    });
+    const activity: string[] = [];
+    const text = await readSseContent(stream, () => undefined, (delta) => activity.push(delta));
+    expect(text).toBe("");
+    expect(activity).toEqual(["ponder", "chain"]);
+  });
+
   it("rejects a link to a node that has not been emitted", () => {
     expect(() => foldIrEvents([
       { op: "story", entryScene: "prologue" },
