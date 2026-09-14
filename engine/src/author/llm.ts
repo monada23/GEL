@@ -1,9 +1,9 @@
-import { loadAuthorConfig, resolveAgent, type AuthorAgent, type ReasoningEffort } from "./config";
+import { loadAuthorConfig, resolveAgent, type AuthorAgent } from "./config";
 import { readSseContent } from "./stream";
 
 export interface LlmClient {
   completeJson(system: string, user: string): Promise<unknown>;
-  stream?(system: string, user: string, onDelta: (text: string) => void, extra?: readonly { role: "assistant" | "user"; content: string }[]): Promise<string>;
+  stream?(system: string, user: string, onDelta: (text: string) => void, extra?: readonly { role: "assistant" | "user"; content: string }[], onActivity?: (text: string) => void): Promise<string>;
 }
 
 export class LlmError extends Error {
@@ -21,7 +21,7 @@ export class OpenAiCompatibleClient implements LlmClient {
     public readonly apiKey: string,
     public readonly baseUrl: string,
     public readonly model: string,
-    public readonly reasoning?: ReasoningEffort,
+    public readonly reasoning?: unknown,
     public readonly temperature?: number,
   ) {}
 
@@ -29,7 +29,7 @@ export class OpenAiCompatibleClient implements LlmClient {
     return parseJsonPayload(await this.stream(system, user, () => undefined));
   }
 
-  public async stream(system: string, user: string, onDelta: (text: string) => void, extra: readonly { role: "assistant" | "user"; content: string }[] = []): Promise<string> {
+  public async stream(system: string, user: string, onDelta: (text: string) => void, extra: readonly { role: "assistant" | "user"; content: string }[] = [], onActivity?: (text: string) => void): Promise<string> {
     if (this.apiKey.trim().length === 0) {
       throw new LlmError("missing_api_key", `Provider '${this.provider}' apiKey is empty`);
     }
@@ -45,7 +45,7 @@ export class OpenAiCompatibleClient implements LlmClient {
       input,
       stream: true,
     };
-    if (this.reasoning !== undefined) body.reasoning = { effort: this.reasoning };
+    if (this.reasoning !== undefined) body.reasoning = this.reasoning;
     if (this.temperature !== undefined) body.temperature = this.temperature;
     const response = await fetch(`${this.baseUrl}/responses`, {
       method: "POST",
@@ -60,7 +60,7 @@ export class OpenAiCompatibleClient implements LlmClient {
       throw new LlmError("llm_http", `LLM HTTP ${response.status}: ${payload.slice(0, 500)}`);
     }
     if (response.body === null) throw new LlmError("llm_http", "LLM response is missing a body");
-    return readSseContent(response.body, onDelta);
+    return readSseContent(response.body, onDelta, onActivity);
   }
 }
 

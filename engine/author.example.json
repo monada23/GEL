@@ -22,12 +22,12 @@
     "review": {
       "provider": "openai",
       "model": "gpt-4o",
-      "reasoning": "low"
+      "reasoning": { "effort": "low" }
     },
     "ir": {
       "provider": "openai",
       "model": "gpt-5",
-      "reasoning": "medium"
+      "reasoning": { "effort": "medium" }
     }
   },
   "maxConsecutiveErrors": 3

@@ -62,13 +62,6 @@ describe("author config parse", () => {
   it("rejects unknown fields", () => {
     expect(() => parseAuthorConfig({ ...valid, extra: true }, "mem")).toThrow(/Unknown config field/);
   });
-
-  it("rejects invalid reasoning", () => {
-    expect(() => parseAuthorConfig({
-      ...valid,
-      agents: { ...valid.agents, review: { provider: "local", model: "qwen2.5", reasoning: "max" } },
-    }, "mem")).toThrow(/reasoning/);
-  });
 });
 
 describe("author config files", () => {

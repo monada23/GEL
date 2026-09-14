@@ -21,13 +21,10 @@ export interface AuthorProvider {
   apiKey: string;
 }
 
-export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
-export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
-
 export interface AuthorAgentRef {
   provider: string;
   model: string;
-  reasoning?: ReasoningEffort;
+  reasoning?: unknown;
   temperature?: number;
 }
 
@@ -105,13 +102,7 @@ export function parseAuthorConfig(value: unknown, path: string): AuthorConfig {
     if (typeof raw.model !== "string" || raw.model.trim().length === 0) {
       throw new ConfigError("invalid_config", `Agent '${agent}' model is required: ${path}`, path);
     }
-    let reasoning: ReasoningEffort | undefined;
-    if (raw.reasoning !== undefined) {
-      if (typeof raw.reasoning !== "string" || !REASONING_EFFORTS.includes(raw.reasoning as ReasoningEffort)) {
-        throw new ConfigError("invalid_config", `Agent '${agent}' reasoning must be one of ${REASONING_EFFORTS.join(", ")}: ${path}`, path);
-      }
-      reasoning = raw.reasoning as ReasoningEffort;
-    }
+    const reasoning = raw.reasoning;
     let temperature: number | undefined;
     if (raw.temperature !== undefined) {
       if (typeof raw.temperature !== "number" || !Number.isFinite(raw.temperature) || raw.temperature < 0 || raw.temperature > 2) {
@@ -157,7 +148,7 @@ export function resolveAgent(
   config: AuthorConfig,
   agent: AuthorAgent,
   path = authorConfigPath(),
-): AuthorProvider & { model: string; provider: string; reasoning?: ReasoningEffort; temperature?: number } {
+): AuthorProvider & { model: string; provider: string; reasoning?: unknown; temperature?: number } {
   const ref = config.agents[agent];
   const provider = config.providers[ref.provider];
   if (provider === undefined) {
