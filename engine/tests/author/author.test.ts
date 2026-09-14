@@ -272,4 +272,126 @@ describe("scene generation", () => {
     expect(result.ok).toBe(true);
     expect(prompt).toContain("Make the station colder.");
   });
+
+  it("flushes IR scene events into stream.jsonl as each scene completes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-ir-progressive-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "alpha.md"), "---\nid: alpha\ntitle: 甲\n---\n\n# Goal\nA.\n", "utf8");
+    await writeFile(join(dir, "scenes", "beta.md"), "---\nid: beta\ntitle: 乙\n---\n\n# Goal\nB.\n", "utf8");
+    await writeFile(join(dir, "scripts", "alpha.md"), "---\nid: alpha\ntitle: 甲\n---\n\n# Script\nA line.\n", "utf8");
+    await writeFile(join(dir, "scripts", "beta.md"), "---\nid: beta\ntitle: 乙\n---\n\n# Script\nB line.\n", "utf8");
+    const { generateIr } = await import("../../src/author/stages");
+    let releaseBeta = (): void => undefined;
+    const betaGate = new Promise<void>((resolve) => { releaseBeta = resolve; });
+    const interior = (id: string): string => `${[
+      { op: "node", id: "d1", type: "gel.dialogue", text: `${id} beat` },
+      { op: "node", id: "end", type: "gel.end_story" },
+      { op: "link", from: ["entry", "out"], to: ["d1", "in"] },
+      { op: "link", from: ["d1", "next"], to: ["end", "in"] },
+      { op: "done" },
+    ].map((event) => JSON.stringify(event)).join("\n")}\n`;
+    const run = generateIr(dir, undefined, {
+      completeJson: async () => ({}),
+      stream: async (system, user, onDelta) => {
+        if (system.includes("lay out")) {
+          onDelta(`${JSON.stringify({ op: "story", entryScene: "alpha" })}\n${JSON.stringify({ op: "done" })}\n`);
+          return "";
+        }
+        const sceneId = user.includes("# Fill scene beta") ? "beta" : "alpha";
+        if (sceneId === "beta") await betaGate;
+        onDelta(interior(sceneId));
+        return "";
+      },
+    });
+    const jsonl = join(dir, "ir", "stream.jsonl");
+    let streamed = "";
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && !streamed.includes("alpha beat")) {
+      streamed = await readFile(jsonl, "utf8").catch(() => "");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    releaseBeta();
+    const result = await run;
+    expect(streamed).toContain("alpha beat");
+    expect(result.ok).toBe(true);
+  });
+
+  it("writes graph routes into stream.jsonl during the graph step", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-ir-routes-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "alpha.md"), "---\nid: alpha\ntitle: 甲\nexits: [to-beta]\n---\n\n# Goal\nA.\n", "utf8");
+    await writeFile(join(dir, "scenes", "beta.md"), "---\nid: beta\ntitle: 乙\n---\n\n# Goal\nB.\n", "utf8");
+    await writeFile(join(dir, "scripts", "alpha.md"), "---\nid: alpha\ntitle: 甲\n---\n\n# Script\nA line.\n", "utf8");
+    await writeFile(join(dir, "scripts", "beta.md"), "---\nid: beta\ntitle: 乙\n---\n\n# Script\nB line.\n", "utf8");
+    const { generateIr } = await import("../../src/author/stages");
+    let releaseScenes = (): void => undefined;
+    const sceneGate = new Promise<void>((resolve) => { releaseScenes = resolve; });
+    const interior = (id: string): string => `${(id === "alpha"
+      ? [
+          { op: "node", id: "out", type: "gel.graph_output", interfaceId: "to-beta" },
+          { op: "link", from: ["entry", "out"], to: ["out", "in"] },
+          { op: "done" },
+        ]
+      : [
+          { op: "node", id: "end", type: "gel.end_story" },
+          { op: "link", from: ["entry", "out"], to: ["end", "in"] },
+          { op: "done" },
+        ]
+    ).map((event) => JSON.stringify(event)).join("\n")}\n`;
+    const run = generateIr(dir, undefined, {
+      completeJson: async () => ({}),
+      stream: async (system, user, onDelta) => {
+        if (system.includes("lay out")) {
+          onDelta(`${[
+            { op: "story", entryScene: "alpha" },
+            { op: "route", from: "alpha", exit: "to-beta", to: "beta" },
+            { op: "done" },
+          ].map((event) => JSON.stringify(event)).join("\n")}\n`);
+          return "";
+        }
+        await sceneGate;
+        onDelta(interior(user.includes("# Fill scene beta") ? "beta" : "alpha"));
+        return "";
+      },
+    });
+    const jsonl = join(dir, "ir", "stream.jsonl");
+    let streamed = "";
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && !streamed.includes('"op":"route"')) {
+      streamed = await readFile(jsonl, "utf8").catch(() => "");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    releaseScenes();
+    const result = await run;
+    expect(streamed).toContain('"op":"route"');
+    expect(result.ok).toBe(true);
+  });
+
+  it("pulses activity on streamed content deltas", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gel-author-ir-activity-"));
+    await initAuthoring(dir);
+    await writeFile(join(dir, "scenes", "alpha.md"), "---\nid: alpha\ntitle: 甲\n---\n\n# Goal\nA.\n", "utf8");
+    await writeFile(join(dir, "scripts", "alpha.md"), "---\nid: alpha\ntitle: 甲\n---\n\n# Script\nA line.\n", "utf8");
+    const { generateIr } = await import("../../src/author/stages");
+    const result = await generateIr(dir, undefined, {
+      completeJson: async () => ({}),
+      stream: async (system, _user, onDelta) => {
+        if (system.includes("lay out")) {
+          onDelta(`${JSON.stringify({ op: "story", entryScene: "alpha" })}\n`);
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          onDelta(`${JSON.stringify({ op: "done" })}\n`);
+          return "";
+        }
+        onDelta(`${[
+          { op: "node", id: "end", type: "gel.end_story" },
+          { op: "link", from: ["entry", "out"], to: ["end", "in"] },
+          { op: "done" },
+        ].map((event) => JSON.stringify(event)).join("\n")}\n`);
+        return "";
+      },
+    });
+    expect(result.ok).toBe(true);
+    const activity = await readFile(join(dir, "activity"), "utf8");
+    expect(activity.length).toBeGreaterThan(0);
+  });
 });

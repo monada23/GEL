@@ -1,3 +1,4 @@
+import { appendFileSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { validateSceneIrFile, validateStoryIr } from "./ir";
@@ -117,6 +118,7 @@ export function idleStatus(): AuthorStatus {
 export async function withStatus(directory: string, stage: string, run: () => Promise<AuthorResult>): Promise<AuthorResult> {
   const dir = authoringDirectory(directory);
   await writeStatus(dir, { state: "running", stage, ok: true, message: "", diagnostics: [], result: null });
+  writeFileSync(join(dir, "activity"), "");
   try {
     const result = await run();
     await writeStatus(dir, {
@@ -134,6 +136,16 @@ export async function withStatus(directory: string, stage: string, run: () => Pr
     await writeStatus(dir, { state: "done", stage, ok: false, message: result.message ?? "", diagnostics, result });
     return result;
   }
+}
+
+let lastActivityPulse = 0;
+
+// Token/reasoning heartbeat. Editor polls activity file size to boost the spinner.
+export function pulseActivity(directory: string): void {
+  const now = Date.now();
+  if (now - lastActivityPulse < 80) return;
+  lastActivityPulse = now;
+  appendFileSync(join(directory, "activity"), ".");
 }
 
 async function readMarkdownFiles<T>(
